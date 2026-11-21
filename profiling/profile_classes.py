@@ -4,6 +4,7 @@ import os
 import class_observer
 import pytest
 import shared_fixture_observer
+import attribute_observer
 
 submit = ProcessPoolExecutor.submit
 
@@ -15,6 +16,18 @@ def with_context(pool, function, /, *args, **kwargs):
 class Events:
     def pytest_collection_finish(self, session):
         shared_fixture_observer.install(session.items, lambda: class_observer.active)
+
+    @pytest.hookimpl(wrapper=True)
+    def pytest_fixture_setup(self, fixturedef, request):
+        previous = attribute_observer.shared_scope
+        if fixturedef.scope != "function":
+            attribute_observer.shared_scope = (
+                request.node.nodeid if fixturedef.scope in {"class", "module"} else ""
+            )
+        try:
+            return (yield)
+        finally:
+            attribute_observer.shared_scope = previous
 
     @pytest.hookimpl(wrapper=True)
     def pytest_runtest_protocol(self, item):

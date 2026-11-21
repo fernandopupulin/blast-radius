@@ -120,36 +120,62 @@ def module_structure(tree):
     return ast.dump(StripBodies().visit(tree))
 
 
-def scalar_class_assignment(tree, line):
-    for definition in tree.body:
-        if not isinstance(definition, ast.ClassDef):
+def literal_shape(value, depth=0):
+    kind = type(value)
+    if kind in (bool, int, type(None)):
+        return kind
+    if kind is str and len(value) <= 120 and (not value or value.isprintable()):
+        return kind
+    if depth >= 4:
+        raise ValueError("nested configuration value")
+    if kind in (tuple, list) and len(value) <= 64:
+        return kind, tuple(literal_shape(item, depth + 1) for item in value)
+    if kind is dict and len(value) <= 64 and all(type(key) is str for key in value):
+        return kind, tuple((key, literal_shape(item, depth + 1)) for key, item in value.items())
+    raise ValueError("unrecognized configuration value")
+
+
+def configuration_on_line(body, line):
+    for definition in body:
+        if not isinstance(definition, ast.ClassDef) or not definition.lineno <= line <= definition.end_lineno:
             continue
         for node in definition.body:
-            if (isinstance(node, ast.Assign) and node.lineno == node.end_lineno == line
-                    and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)):
-                try:
-                    value = ast.literal_eval(node.value)
-                except (ValueError, TypeError):
-                    continue
-                if type(value) in (bool, int):
-                    return node, type(value)
-    return None, None
+            if isinstance(node, ast.Assign) and len(node.targets) == 1:
+                target = node.targets[0]
+            elif isinstance(node, ast.AnnAssign):
+                target = node.target
+            else:
+                continue
+            if isinstance(target, ast.Name) and node.value is not None and node.lineno <= line <= node.end_lineno:
+                yield node, target.id
+        yield from configuration_on_line(definition.body, line)
 
 
-def changed_attribute(path, line, before, after, readers):
+def changed_attribute(path, line, before, after, profile):
     if not path.startswith(("sqlglot/dialects/", "sqlglot/parsers/", "sqlglot/generators/")):
         return 0
-    old, old_type = scalar_class_assignment(before, line)
-    new, new_type = scalar_class_assignment(after, line)
-    if old is None or new is None or old_type is not new_type:
+    old_matches = list(configuration_on_line(before.body, line))
+    new_matches = list(configuration_on_line(after.body, line))
+    if len(old_matches) != 1 or len(new_matches) != 1:
         return 0
-    name = old.targets[0].id
-    if name != new.targets[0].id or name not in readers:
+    (old, name), = old_matches
+    (new, new_name), = new_matches
+    readers = profile["scalar_attribute_readers"]
+    if name != new_name or name not in readers:
+        return 0
+    try:
+        if literal_shape(ast.literal_eval(old.value)) != literal_shape(ast.literal_eval(new.value)):
+            return 0
+    except (ValueError, TypeError):
         return 0
     previous = new.value
     try:
         new.value = old.value
         if ast.dump(before) == ast.dump(after):
+            module = path.removesuffix(".py").replace("/", ".")
+            owner = enclosing_class(before.body, line)
+            if exact := profile.get("attribute_owners", {}).get(name, {}).get(f"{module}:{owner}"):
+                return int(exact, 16)
             return int(readers[name], 16)
     finally:
         new.value = previous
@@ -159,8 +185,6 @@ def changed_attribute(path, line, before, after, readers):
 def expression_on_line(tree, line):
     matches = []
     for node in ast.walk(tree):
-        if getattr(node, "lineno", None) != line:
-            continue
         if isinstance(node, ast.If):
             field = "test"
         elif isinstance(node, (ast.Assign, ast.Return)):
@@ -168,7 +192,7 @@ def expression_on_line(tree, line):
         else:
             continue
         expression = getattr(node, field)
-        if expression is not None and expression.lineno == expression.end_lineno == line:
+        if expression is not None and node.lineno <= line <= expression.end_lineno:
             matches.append((node, field, expression))
     return matches
 
@@ -188,9 +212,64 @@ def isolated_expression_change(before, after, line):
         return False
     try:
         setattr(node, field, old_value)
-        return ast.dump(before) == ast.dump(after)
+        if ast.dump(before) == ast.dump(after):
+            return range(old[0][0].lineno, old_value.end_lineno + 1)
     finally:
         setattr(node, field, value)
+
+
+def defaults_on_line(tree, line):
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if any(not isinstance(decorator, ast.Name) or decorator.id not in {"classmethod", "staticmethod"}
+               for decorator in node.decorator_list):
+            continue
+        for defaults in (node.args.defaults, node.args.kw_defaults):
+            for index, default in enumerate(defaults):
+                if default is not None and default.lineno == default.end_lineno == line:
+                    yield node, defaults, index
+
+
+def default_value_readers(before, after, line, record, reflection):
+    if reflection is None:
+        return 0
+    old = list(defaults_on_line(before, line))
+    new = list(defaults_on_line(after, line))
+    if len(old) != 1 or len(new) != 1:
+        return 0
+    function, old_values, index = old[0]
+    _, new_values, new_index = new[0]
+    try:
+        original = ast.literal_eval(old_values[index])
+        replacement = ast.literal_eval(new_values[new_index])
+    except (TypeError, ValueError):
+        return 0
+    if type(original) not in (bool, int, str) or type(original) is not type(replacement):
+        return 0
+    saved = new_values[new_index]
+    try:
+        new_values[new_index] = old_values[index]
+        if ast.dump(before) != ast.dump(after):
+            return 0
+    finally:
+        new_values[new_index] = saved
+    start = function.body[0].lineno
+    if any(start <= number <= function.end_lineno for number in record["collection"]):
+        return 0
+    observed = 0
+    for number in range(start, function.end_lineno + 1):
+        if mask := record["lines"].get(str(number)):
+            observed |= int(mask, 16)
+    return (observed | int(reflection, 16)) if observed else 0
+
+
+def enclosing_class(body, line, owner=()):
+    for node in body:
+        if isinstance(node, ast.ClassDef) and node.lineno <= line <= node.end_lineno:
+            qualified = (*owner, node.name)
+            return enclosing_class(node.body, line, qualified)
+    return ".".join(owner)
 
 
 def class_dict_entries(body, line, owner=()):
@@ -280,6 +359,54 @@ def class_config_change(path, line, before, after, profile):
     return 0
 
 
+def expression_attribute(node):
+    if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == "exp":
+        return node.attr
+    return None
+
+
+def return_type_on_line(tree, line):
+    for statement in tree.body:
+        if not (isinstance(statement, ast.Assign) and len(statement.targets) == 1
+                and isinstance(statement.targets[0], ast.Name)
+                and statement.targets[0].id == "EXPRESSION_METADATA"
+                and isinstance(statement.value, ast.Dict)):
+            continue
+        for key, entry in zip(statement.value.keys, statement.value.values):
+            name = expression_attribute(key)
+            if not name or not isinstance(entry, ast.Dict):
+                continue
+            for index, (field, value) in enumerate(zip(entry.keys, entry.values)):
+                if (isinstance(field, ast.Constant) and field.value == "returns"
+                        and value.lineno == value.end_lineno == line
+                        and isinstance(value, ast.Attribute) and expression_attribute(value.value) == "DType"):
+                    yield name, entry.values, index
+
+
+def typing_config_readers(before, after, line, profile):
+    old = list(return_type_on_line(before, line))
+    new = list(return_type_on_line(after, line))
+    if len(old) != 1 or len(new) != 1:
+        return 0
+    (name, old_values, index), = old
+    (new_name, values, new_index), = new
+    if name != new_name or not all(value.attr in profile["sql_type_names"]
+                                  for value in (old_values[index], values[new_index])):
+        return 0
+    observed = 0
+    for key, mask in profile["class_users"].items():
+        if key.startswith("sqlglot.expressions.") and key.partition(":")[2] == name:
+            observed |= int(mask, 16)
+    saved = values[new_index]
+    try:
+        values[new_index] = old_values[index]
+        if observed and ast.dump(before) == ast.dump(after):
+            return (observed & int(profile["annotation_readers"], 16)) | int(profile["metadata_inspection"], 16)
+        return 0
+    finally:
+        values[new_index] = saved
+
+
 def file_users(path, profile, cache):
     if path not in cache:
         coverage = profile["files"].get(path, {})
@@ -347,8 +474,14 @@ def choose(patch, profile, file_cache):
         )
         if one_line:
             line = next(iter(changed))
-            readers = changed_attribute(path, line, before, after, profile["scalar_attribute_readers"])
+            readers = changed_attribute(path, line, before, after, profile)
             readers |= class_config_change(path, line, before, after, profile)
+            if path.startswith("sqlglot/typing/"):
+                readers |= typing_config_readers(before, after, line, profile)
+            if path.startswith("sqlglot/"):
+                readers |= default_value_readers(
+                    before, after, line, profile["files"][path], profile["default_reflection_readers"]
+                )
             if readers:
                 selected |= readers
                 continue
@@ -374,16 +507,26 @@ def choose(patch, profile, file_cache):
             _, start, end = max(candidates, key=lambda scope: scope[2] - scope[0])
             if any(start <= number <= end for number in coverage["collection"]):
                 raise ValueError("function runs during test collection")
-            if isolated and (value := coverage["lines"].get(str(line))):
-                scope_mask |= int(value, 16)
-                continue
+            if isolated:
+                reached = 0
+                for position in isolated:
+                    if value := coverage["lines"].get(str(position)):
+                        reached |= int(value, 16)
+                if reached:
+                    scope_mask |= reached
+                    continue
             measured = 0
             for number in range(start, end + 1):
                 value = coverage["lines"].get(str(number))
                 if value:
                     measured |= int(value, 16)
             if not measured:
-                raise ValueError("scope has no measured tests")
+                owner = enclosing_class(before.body, line)
+                module = path.removesuffix(".py").replace("/", ".")
+                class_mask = profile["class_users"].get(f"{module}:{owner}")
+                if not class_mask:
+                    raise ValueError("scope has no measured tests")
+                measured = int(class_mask, 16)
             scope_mask |= measured
         selected |= scope_mask
     return selected, nearby

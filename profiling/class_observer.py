@@ -7,6 +7,7 @@ import os
 import sys
 from pathlib import Path
 import shared_fixture_observer
+import attribute_observer
 
 active = os.environ.get("BLAST_CLASS_CONTEXT", "")
 used = defaultdict(set)
@@ -75,6 +76,7 @@ def enable():
 
     for cls in (Dialect, Expr, Parser, Generator, Tokenizer):
         cls.__init__ = observe(cls.__init__)
+    attribute_observer.install((Dialect, Parser, Generator, Tokenizer), lambda: active)
 
     sys.addaudithook(audit)
     atexit.register(save)
@@ -107,6 +109,14 @@ def save():
         "cached_consumers": {
             key: {owner: sorted(tests) for owner, tests in owners.items()}
             for key, owners in shared_fixture_observer.consumers.items()
+        },
+        "attribute_reads": {
+            name: {owner: sorted(tests) for owner, tests in owners.items()}
+            for name, owners in attribute_observer.readers.items()
+        },
+        "shared_attribute_reads": {
+            name: {owner: sorted(scopes) for owner, scopes in owners.items()}
+            for name, owners in attribute_observer.shared_readers.items()
         },
     }
     Path(f"/profile/results/{os.getpid()}.json").write_text(json.dumps(result), encoding="utf-8")
