@@ -4,17 +4,52 @@ from collections import defaultdict
 from functools import wraps
 import json
 import os
+import sys
 from pathlib import Path
 
 active = os.environ.get("BLAST_CLASS_CONTEXT", "")
 used = defaultdict(set)
 subprocess_tests = set()
 enabled = False
+reads = defaultdict(set)
+shared_reads = defaultdict(set)
+ROOT = os.getcwd() + "/"
 
 
 def audit(event, arguments):
-    if event == "subprocess.Popen" and active:
+    if not active:
+        return
+    if event == "subprocess.Popen":
         subprocess_tests.add(active)
+    if event != "open" or not isinstance(arguments[0], str):
+        return
+    path = arguments[0]
+    if path.startswith(ROOT):
+        path = path[len(ROOT):]
+    elif path.startswith("./"):
+        path = path[2:]
+    if path.startswith("tests/fixtures/"):
+        reads[path].add(active)
+        frame = sys._getframe(1)
+        while frame is not None:
+            function = frame.f_code.co_name
+            if function in {"setUpClass", "setup_class"}:
+                shared_reads[path].add(active.rsplit("::", 1)[0])
+                break
+            if function in {"setUpModule", "setup_module"}:
+                shared_reads[path].add(active.split("::", 1)[0])
+                break
+            frame = frame.f_back
+    elif path.startswith("sqlglot/") and path.endswith(".py"):
+        frame = sys._getframe(1)
+        for _ in range(8):
+            if frame is None:
+                break
+            if frame.f_code.co_filename in ("<frozen importlib._bootstrap_external>",
+                                             "<frozen importlib._bootstrap>"):
+                return
+            frame = frame.f_back
+        reads[path].add(active)
 
 
 def observe(method):
@@ -63,5 +98,10 @@ def save():
             if parent.__module__.startswith("sqlglot.")
         }
         contexts[test] = sorted(symbols)
-    result = {"tests": contexts, "subprocess_tests": sorted(subprocess_tests)}
+    result = {
+        "tests": contexts,
+        "subprocess_tests": sorted(subprocess_tests),
+        "reads": {key: sorted(value) for key, value in reads.items()},
+        "shared_reads": {key: sorted(value) for key, value in shared_reads.items()},
+    }
     Path(f"/profile/results/{os.getpid()}.json").write_text(json.dumps(result), encoding="utf-8")

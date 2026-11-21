@@ -243,17 +243,32 @@ def class_config_change(path, line, before, after, profile):
     return 0
 
 
-def choose(patch, profile):
+def file_users(path, profile, cache):
+    if path not in cache:
+        coverage = profile["files"].get(path, {})
+        mask = 0
+        for value in coverage.get("lines", {}).values():
+            if value:
+                mask |= int(value, 16)
+        cache[path] = mask
+    return cache[path]
+
+
+def choose(patch, profile, file_cache):
     selected = 0
+    nearby = 0
     for path, section in sections(patch).items():
         source = profile["sources"][path]
         updated, changed, inserted = apply_section(
             path, section, source.removesuffix("\n").split("\n")
         )
+        selected |= int(profile["file_reads"].get(path, "0"), 16)
         if path in profile["fixtures"]:
             selected |= int(profile["fixtures"][path], 16)
             continue
 
+        selected |= int(profile["subprocess_users"], 16)
+        nearby |= file_users(path, profile, file_cache)
         before = ast.parse(source, filename=path, type_comments=True)
         after = ast.parse(updated, filename=path, type_comments=True)
         compile(after, path, "exec")
@@ -303,7 +318,33 @@ def choose(patch, profile):
                 raise ValueError("scope has no measured tests")
             scope_mask |= measured
         selected |= scope_mask
-    return selected
+    return selected, nearby
+
+
+def worker_cost(workers, durations):
+    return 2000 * len(workers) + max(
+        (sum(durations[number] for number in group) for group in workers), default=0
+    )
+
+
+def reserve_workers(primary, candidates, durations):
+    workers = partition(primary)
+    if not candidates:
+        return workers
+    # The original selection stays mandatory. Add tests that fit the
+    # existing simulated cost before spending more CI time.
+    ceiling = worker_cost(workers, durations)
+    ordered = sorted(candidates, key=lambda item: (item[1], item[0]))
+    low, high = 1, len(ordered)
+    while low <= high:
+        count = (low + high) // 2
+        preferred = partition(primary + ordered[:count])
+        if worker_cost(preferred, durations) <= ceiling:
+            workers = preferred
+            low = count + 1
+        else:
+            high = count - 1
+    return workers
 
 
 def main(data=DATA, mapping=MAP):
@@ -321,13 +362,18 @@ def main(data=DATA, mapping=MAP):
         else:
             unknown.append(entry)
     fallback = partition(all_tests)
+    durations = dict(all_tests)
+    file_cache = {}
     for path in sorted((data / "commits").glob("*.patch")):
         try:
-            mask = choose(path.read_text(encoding="utf-8"), profile)
+            mask, nearby = choose(path.read_text(encoding="utf-8"), profile, file_cache)
         except (LookupError, ValueError, SyntaxError, RecursionError):
             workers = fallback
         else:
-            workers = partition(unknown + [test for bit, test in known if mask & bit])
+            primary = unknown + [test for bit, test in known if mask & bit]
+            extra = nearby & ~mask
+            candidates = [test for bit, test in known if extra & bit]
+            workers = reserve_workers(primary, candidates, durations)
         print(json.dumps({"commit": path.stem, "workers": workers}, separators=(",", ":")))
 
 

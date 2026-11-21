@@ -1,6 +1,6 @@
-# Blast Radius v4
+# Blast Radius v5
 
-A v4 usa cobertura por função, acesso a fixtures e balanceamento de 0 a 8 workers. Para uma troca isolada de inteiro em um atributo de classe de dialeto, usa o mapa de leituras observadas desse atributo no SQLGlot e nos testes. Algumas alterações isoladas em configurações de classes também podem usar o mapa de construção e referências dessas classes.
+A v5 mantém a seleção da v4 e acrescenta dependências observadas na leitura de arquivos. A auditoria registra fixtures lidas em preparação de classe ou módulo e associa a dependência aos testes que compartilham essa preparação. Para Python, inclui leitores diretos do fonte e testes que iniciam subprocessos. Aproveita a capacidade restante da divisão em workers para incluir testes adicionais com cobertura do arquivo quando eles cabem no mesmo custo simulado da seleção obrigatória.
 
 O mapa reúne os testes que passaram por qualquer leitura Python observada, inclusive em código compartilhado. A geração descarta nomes com acesso literal indireto, importação, referências sem cobertura ou leitura durante a coleta. A regra cobre alterações simples de literais, com os demais casos encaminhados à lógica de cobertura da v2 ou à suíte inteira. A análise estática pode deixar de encontrar acessos puramente dinâmicos, por exemplo nomes construídos em tempo de execução.
 
@@ -15,8 +15,11 @@ A coleta adicional registra as classes usadas por cada teste, incluindo suas sup
 | v3, com mapa de atributos inteiros | 266,135 | 0 |
 | v4, primeira variante com mapa de classes | 197,589 | 0 |
 | v4, mapa de classes sem referências de identidade | 174,581 | 0 |
+| v5, dependências de leitura e preparação compartilhada | 186,307 | 0 |
 
-Em prática, a v3 registrou 539,987 s de seleção e um miss, que acrescentou 300 s na simulação. A v4 mantém a cobertura da função mesmo para condições simples, e sua pontuação oficial ainda precisa ser medida.
+Em prática, a v3 registrou 539,987 s de seleção e um miss. A v4 registrou 528,624 s de seleção e um miss, para 829,9 s oficiais. O recibo não identifica o patch omitido.
+
+Uma mutação independente de fixture compartilhada pelo executor e pelo otimizador reproduziu uma falha omitida pela v4. A v5 recuperou essa falha e incluiu todas as demais falhas registradas pela suíte completa para essa mutação.
 
 ## Executar com o kit
 
@@ -35,7 +38,8 @@ python /profile/pack_map.py
 python /profile/build_attribute_map.py /src /profile/packed.json.gz /profile/attributes.json.gz
 mkdir -p /profile/results
 PYTHON_CPU_COUNT=4 SKIP_INTEGRATION=0 PYTHONPATH=/profile:/src python /profile/profile_classes.py
-python /profile/build_class_map.py /profile/attributes.json.gz /profile/results /profile/final.json.gz
+python /profile/build_class_map.py /profile/attributes.json.gz /profile/results /profile/classes.json.gz
+python /profile/build_read_map.py /profile/classes.json.gz /profile/results /profile/final.json.gz
 ```
 
 Copie `/profile/final.json.gz` para a raiz com o nome `impact.json.gz`. Os geradores usam o checkout e as observações do commit fixado. Use uma pasta `/profile/results` vazia para cada coleta.
