@@ -250,7 +250,7 @@ def main(data=DATA, mapping=MAP):
     for path in sorted((data / "commits").glob("*.patch")):
         try:
             mask = choose(path.read_text(encoding="utf-8"), profile)
-        except (LookupError, ValueError, SyntaxError, UnicodeError):
+        except (LookupError, ValueError, SyntaxError, RecursionError):
             workers = fallback
         else:
             workers = partition(unknown + [test for bit, test in known if mask & bit])
