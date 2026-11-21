@@ -120,7 +120,7 @@ def module_structure(tree):
     return ast.dump(StripBodies().visit(tree))
 
 
-def integer_class_assignment(tree, line):
+def scalar_class_assignment(tree, line):
     for definition in tree.body:
         if not isinstance(definition, ast.ClassDef):
             continue
@@ -131,17 +131,17 @@ def integer_class_assignment(tree, line):
                     value = ast.literal_eval(node.value)
                 except (ValueError, TypeError):
                     continue
-                if type(value) is int:
-                    return node
-    return None
+                if type(value) in (bool, int):
+                    return node, type(value)
+    return None, None
 
 
 def changed_attribute(path, line, before, after, readers):
-    if not path.startswith("sqlglot/dialects/"):
+    if not path.startswith(("sqlglot/dialects/", "sqlglot/parsers/", "sqlglot/generators/")):
         return 0
-    old = integer_class_assignment(before, line)
-    new = integer_class_assignment(after, line)
-    if old is None or new is None:
+    old, old_type = scalar_class_assignment(before, line)
+    new, new_type = scalar_class_assignment(after, line)
+    if old is None or new is None or old_type is not new_type:
         return 0
     name = old.targets[0].id
     if name != new.targets[0].id or name not in readers:
@@ -154,6 +154,43 @@ def changed_attribute(path, line, before, after, readers):
     finally:
         new.value = previous
     return 0
+
+
+def expression_on_line(tree, line):
+    matches = []
+    for node in ast.walk(tree):
+        if getattr(node, "lineno", None) != line:
+            continue
+        if isinstance(node, ast.If):
+            field = "test"
+        elif isinstance(node, (ast.Assign, ast.Return)):
+            field = "value"
+        else:
+            continue
+        expression = getattr(node, field)
+        if expression is not None and expression.lineno == expression.end_lineno == line:
+            matches.append((node, field, expression))
+    return matches
+
+
+def isolated_expression_change(before, after, line):
+    old = expression_on_line(before, line)
+    new = expression_on_line(after, line)
+    if len(old) != 1 or len(new) != 1:
+        return False
+    _, old_field, old_value = old[0]
+    node, field, value = new[0]
+    if field != old_field:
+        return False
+    if any(isinstance(part, (ast.NamedExpr, ast.Yield, ast.YieldFrom, ast.Await,
+                             ast.Lambda, ast.GeneratorExp, ast.ListComp, ast.SetComp, ast.DictComp))
+           for expression in (old_value, value) for part in ast.walk(expression)):
+        return False
+    try:
+        setattr(node, field, old_value)
+        return ast.dump(before) == ast.dump(after)
+    finally:
+        setattr(node, field, value)
 
 
 def class_dict_entries(body, line, owner=()):
@@ -254,6 +291,27 @@ def file_users(path, profile, cache):
     return cache[path]
 
 
+def fixture_metadata(source):
+    """Mirror the fixture reader's splitting without executing SQL."""
+    statements = "\n".join(
+        line for line in source.splitlines() if line and not line.startswith("--")
+    ).split(";")
+    metadata = []
+    for statement in statements[:-1:2]:
+        lines = statement.strip().split("\n")
+        headers = []
+        for line in lines:
+            if not line.startswith("#"):
+                break
+            if ":" not in line:
+                return None
+            headers.append(line)
+        if len(headers) == len(lines):
+            return None
+        metadata.append(tuple(headers))
+    return len(statements), metadata
+
+
 def choose(patch, profile, file_cache):
     selected = 0
     nearby = 0
@@ -262,11 +320,17 @@ def choose(patch, profile, file_cache):
         updated, changed, inserted = apply_section(
             path, section, source.removesuffix("\n").split("\n")
         )
-        selected |= int(profile["file_reads"].get(path, "0"), 16)
         if path in profile["fixtures"]:
             selected |= int(profile["fixtures"][path], 16)
+            cached = profile["cached_fixture_readers"].get(path)
+            old_metadata = fixture_metadata(source) if cached else None
+            if old_metadata is not None and old_metadata == fixture_metadata(updated):
+                selected |= int(cached, 16)
+            else:
+                selected |= int(profile["file_reads"].get(path, "0"), 16)
             continue
 
+        selected |= int(profile["file_reads"].get(path, "0"), 16)
         selected |= int(profile["subprocess_users"], 16)
         nearby |= file_users(path, profile, file_cache)
         before = ast.parse(source, filename=path, type_comments=True)
@@ -283,11 +347,12 @@ def choose(patch, profile, file_cache):
         )
         if one_line:
             line = next(iter(changed))
-            readers = changed_attribute(path, line, before, after, profile["integer_attribute_readers"])
+            readers = changed_attribute(path, line, before, after, profile["scalar_attribute_readers"])
             readers |= class_config_change(path, line, before, after, profile)
             if readers:
                 selected |= readers
                 continue
+        isolated = one_line and isolated_expression_change(before, after, next(iter(changed)))
         if path.startswith("tests/") or module_structure(before) != module_structure(after):
             raise ValueError("test code or module-level behavior changed")
         coverage = profile["files"][path]
@@ -309,6 +374,9 @@ def choose(patch, profile, file_cache):
             _, start, end = max(candidates, key=lambda scope: scope[2] - scope[0])
             if any(start <= number <= end for number in coverage["collection"]):
                 raise ValueError("function runs during test collection")
+            if isolated and (value := coverage["lines"].get(str(line))):
+                scope_mask |= int(value, 16)
+                continue
             measured = 0
             for number in range(start, end + 1):
                 value = coverage["lines"].get(str(number))

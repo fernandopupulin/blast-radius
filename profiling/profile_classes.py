@@ -3,6 +3,7 @@ import os
 
 import class_observer
 import pytest
+import shared_fixture_observer
 
 submit = ProcessPoolExecutor.submit
 
@@ -12,6 +13,9 @@ def with_context(pool, function, /, *args, **kwargs):
 
 
 class Events:
+    def pytest_collection_finish(self, session):
+        shared_fixture_observer.install(session.items, lambda: class_observer.active)
+
     @pytest.hookimpl(wrapper=True)
     def pytest_runtest_protocol(self, item):
         class_observer.active = item.nodeid

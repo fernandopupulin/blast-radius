@@ -6,6 +6,7 @@ import json
 import os
 import sys
 from pathlib import Path
+import shared_fixture_observer
 
 active = os.environ.get("BLAST_CLASS_CONTEXT", "")
 used = defaultdict(set)
@@ -103,5 +104,9 @@ def save():
         "subprocess_tests": sorted(subprocess_tests),
         "reads": {key: sorted(value) for key, value in reads.items()},
         "shared_reads": {key: sorted(value) for key, value in shared_reads.items()},
+        "cached_consumers": {
+            key: {owner: sorted(tests) for owner, tests in owners.items()}
+            for key, owners in shared_fixture_observer.consumers.items()
+        },
     }
     Path(f"/profile/results/{os.getpid()}.json").write_text(json.dumps(result), encoding="utf-8")

@@ -9,7 +9,7 @@ root, base, output = map(Path, sys.argv[1:])
 profile = json.loads(gzip.decompress(base.read_bytes()))
 
 
-def integer_attribute(node):
+def scalar_attribute(node):
     if not isinstance(node, ast.Assign) or len(node.targets) != 1:
         return None
     target = node.targets[0]
@@ -19,15 +19,16 @@ def integer_attribute(node):
         value = ast.literal_eval(node.value)
     except (ValueError, TypeError):
         return None
-    return target.id if type(value) is int else None
+    return target.id if type(value) in (bool, int) else None
 
 
 names = set()
-for path in (root / "sqlglot" / "dialects").glob("*.py"):
-    tree = ast.parse(path.read_bytes())
-    for definition in tree.body:
-        if isinstance(definition, ast.ClassDef):
-            names.update(name for node in definition.body if (name := integer_attribute(node)))
+for package in ("dialects", "parsers", "generators"):
+    for path in (root / "sqlglot" / package).glob("*.py"):
+        tree = ast.parse(path.read_bytes())
+        for definition in tree.body:
+            if isinstance(definition, ast.ClassDef):
+                names.update(name for node in definition.body if (name := scalar_attribute(node)))
 
 observed = defaultdict(int)
 uncertain = set()
@@ -63,11 +64,12 @@ for directory in ("sqlglot", "tests"):
                     uncertain.add(name)
                 observed[name] |= mask
 
-profile["integer_attribute_readers"] = {
+profile.pop("integer_attribute_readers", None)
+profile["scalar_attribute_readers"] = {
     name: format(mask, "x")
     for name, mask in sorted(observed.items())
     if mask and name not in uncertain
 }
 output.write_bytes(gzip.compress(json.dumps(profile, separators=(",", ":")).encode(), mtime=0))
 print("Eligible attributes and test counts",
-      {name: int(mask, 16).bit_count() for name, mask in profile["integer_attribute_readers"].items()})
+      {name: int(mask, 16).bit_count() for name, mask in profile["scalar_attribute_readers"].items()})

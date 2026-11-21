@@ -1,6 +1,8 @@
-# Blast Radius v5
+# Blast Radius v6
 
-A v5 mantém a seleção da v4 e acrescenta dependências observadas na leitura de arquivos. A auditoria registra fixtures lidas em preparação de classe ou módulo e associa a dependência aos testes que compartilham essa preparação. Para Python, inclui leitores diretos do fonte e testes que iniciam subprocessos. Aproveita a capacidade restante da divisão em workers para incluir testes adicionais com cobertura do arquivo quando eles cabem no mesmo custo simulado da seleção obrigatória.
+A v6 acompanha também os testes que leem os atributos de classe nos quais `setUpClass` armazena pares de SQL. Quando a mudança preserva a estrutura e os metadados que o carregador usa, seleciona esses consumidores e os leitores diretos. Uma mudança que possa afetar a preparação mantém a cobertura compartilhada de toda a classe.
+
+Para Python, uma troca isolada de uma expressão executável em uma linha pode usar a cobertura da linha depois que a AST confirma que o restante do arquivo é equivalente. Mutações com efeito mais amplo mantêm a cobertura da função. O mapa de leituras de atributos escalares cobre inteiros e booleanos de dialetos, parsers e geradores, com verificação de tipo e inicialização.
 
 O mapa reúne os testes que passaram por qualquer leitura Python observada, inclusive em código compartilhado. A geração descarta nomes com acesso literal indireto, importação, referências sem cobertura ou leitura durante a coleta. A regra cobre alterações simples de literais, com os demais casos encaminhados à lógica de cobertura da v2 ou à suíte inteira. A análise estática pode deixar de encontrar acessos puramente dinâmicos, por exemplo nomes construídos em tempo de execução.
 
@@ -16,10 +18,13 @@ A coleta adicional registra as classes usadas por cada teste, incluindo suas sup
 | v4, primeira variante com mapa de classes | 197,589 | 0 |
 | v4, mapa de classes sem referências de identidade | 174,581 | 0 |
 | v5, dependências de leitura e preparação compartilhada | 186,307 | 0 |
+| v6, configurações escalares e consumidores de fixtures | 180,484 | 0 |
 
-Em prática, a v3 registrou 539,987 s de seleção e um miss. A v4 registrou 528,624 s de seleção e um miss, para 829,9 s oficiais. O recibo não identifica o patch omitido.
+Em prática, a v5 registrou 559,384 s simulados e zero misses, com 560,7 s oficiais. A v4 registrou 528,624 s de seleção e um miss, para 829,9 s oficiais.
 
 Uma mutação independente de fixture compartilhada pelo executor e pelo otimizador reproduziu uma falha omitida pela v4. A v5 recuperou essa falha e incluiu todas as demais falhas registradas pela suíte completa para essa mutação.
+
+Nas 12 mutações independentes com falhas confirmadas, v5 e v6 cobriram todas as falhas. O custo total simulado caiu de 154,817 s para 71,522 s. Na mutação que usa preparação compartilhada, caiu de 25,454 s para 8,901 s. Mudanças com metadados inválidos ainda acionam a seleção compartilhada.
 
 ## Executar com o kit
 
