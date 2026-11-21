@@ -120,14 +120,6 @@ def module_structure(tree):
     return ast.dump(StripBodies().visit(tree))
 
 
-def conditional_lines(tree):
-    return {
-        node.lineno
-        for node in ast.walk(tree)
-        if isinstance(node, ast.If) and node.lineno == node.test.end_lineno
-    }
-
-
 def integer_class_assignment(tree, line):
     for definition in tree.body:
         if not isinstance(definition, ast.ClassDef):
@@ -164,6 +156,93 @@ def changed_attribute(path, line, before, after, readers):
     return 0
 
 
+def class_dict_entries(body, line, owner=()):
+    for definition in body:
+        if not isinstance(definition, ast.ClassDef):
+            continue
+        if not definition.lineno <= line <= definition.end_lineno:
+            continue
+        qualified = (*owner, definition.name)
+        for node in definition.body:
+            if not (
+                isinstance(node, ast.Assign)
+                and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+                and isinstance(node.value, ast.Dict)
+            ):
+                continue
+            for index, (key, value) in enumerate(zip(node.value.keys, node.value.values)):
+                if (isinstance(key, ast.Constant) and isinstance(key.value, str)
+                        and key.lineno <= line <= value.end_lineno):
+                    yield ".".join(qualified), node.targets[0].id, key.value, node.value, index
+        yield from class_dict_entries(definition.body, line, qualified)
+
+
+def numeric_escape(value):
+    try:
+        fields = ast.literal_eval(value)
+    except (TypeError, ValueError):
+        return False
+    if not (isinstance(fields, tuple) and len(fields) == 4
+            and all(type(field) is int for field in fields)):
+        return False
+    radix, minimum, maximum, cap = fields
+    return 2 <= radix <= 36 and 1 <= minimum <= maximum <= 16 and 0 <= cap <= 0x10FFFF
+
+
+def show_factory(value):
+    if not isinstance(value, ast.Call):
+        return None
+    if not (isinstance(value.func, ast.Name) and value.func.id == "_show_parser"
+            and len(value.args) == len(value.keywords) == 1):
+        return None
+    item, = value.args
+    switch, = value.keywords
+    if (isinstance(item, ast.Constant) and isinstance(item.value, str)
+            and switch.arg == "target" and isinstance(switch.value, ast.Constant)
+            and type(switch.value.value) is bool):
+        return item.value
+    return None
+
+
+def class_config_change(path, line, before, after, profile):
+    old_entries = {entry[:3]: entry[3:] for entry in class_dict_entries(before.body, line)}
+    new_entries = {entry[:3]: entry[3:] for entry in class_dict_entries(after.body, line)}
+    if old_entries.keys() != new_entries.keys():
+        return 0
+    updates = []
+    for key, (old, old_index) in old_entries.items():
+        new, new_index = new_entries[key]
+        if ast.dump(old.values[old_index]) != ast.dump(new.values[new_index]):
+            updates.append((key, old.values[old_index], new, new_index))
+    if len(updates) != 1:
+        return 0
+    (owner, attribute, _), old_value, new, new_index = updates[0]
+    new_value = new.values[new_index]
+    if attribute == "arg_types" and path.startswith("sqlglot/expressions/"):
+        valid = all(isinstance(node, ast.Constant) and type(node.value) is bool
+                    for node in (old_value, new_value))
+    elif attribute == "NUMERIC_ESCAPES" and path.startswith("sqlglot/dialects/"):
+        valid = numeric_escape(old_value) and numeric_escape(new_value)
+    elif attribute == "SHOW_PARSERS" and path.startswith("sqlglot/parsers/"):
+        valid = show_factory(old_value) is not None and show_factory(new_value) is not None
+    else:
+        return 0
+    if not valid:
+        return 0
+    module = path.removesuffix(".py").replace("/", ".")
+    observed = profile["class_users"].get(f"{module}:{owner}")
+    if not observed:
+        return 0
+    try:
+        new.values[new_index] = old_value
+        if ast.dump(before) == ast.dump(after):
+            return int(observed, 16) | int(profile["subprocess_users"], 16)
+    finally:
+        new.values[new_index] = new_value
+    return 0
+
+
 def choose(patch, profile):
     selected = 0
     for path, section in sections(patch).items():
@@ -190,10 +269,10 @@ def choose(patch, profile):
         if one_line:
             line = next(iter(changed))
             readers = changed_attribute(path, line, before, after, profile["integer_attribute_readers"])
+            readers |= class_config_change(path, line, before, after, profile)
             if readers:
                 selected |= readers
                 continue
-        simple_change = changed if one_line and changed <= conditional_lines(before) & conditional_lines(after) else set()
         if path.startswith("tests/") or module_structure(before) != module_structure(after):
             raise ValueError("test code or module-level behavior changed")
         coverage = profile["files"][path]
@@ -215,11 +294,6 @@ def choose(patch, profile):
             _, start, end = max(candidates, key=lambda scope: scope[2] - scope[0])
             if any(start <= number <= end for number in coverage["collection"]):
                 raise ValueError("function runs during test collection")
-            if line in simple_change:
-                observed = coverage["lines"].get(str(line))
-                if observed:
-                    scope_mask |= int(observed, 16)
-                    continue
             measured = 0
             for number in range(start, end + 1):
                 value = coverage["lines"].get(str(number))
