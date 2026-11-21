@@ -1,10 +1,12 @@
-# Blast Radius v7
+# Blast Radius v8 experimental
 
 A v6 acompanha também os testes que leem os atributos de classe nos quais `setUpClass` armazena pares de SQL. Quando a mudança preserva a estrutura e os metadados que o carregador usa, seleciona esses consumidores e os leitores diretos. Uma mudança que possa afetar a preparação mantém a cobertura compartilhada de toda a classe.
 
 Para Python, uma troca isolada de uma expressão executável em uma linha pode usar a cobertura da linha depois que a AST confirma que o restante do arquivo é equivalente. Mutações com efeito mais amplo mantêm a cobertura da função. O mapa de leituras de atributos escalares cobre inteiros e booleanos de dialetos, parsers e geradores, com verificação de tipo e inicialização.
 
 A v7 amplia a substituição de literais para configurações com strings, listas, tuplas e dicionários de estrutura preservada. Quando possível, atribui a leitura ao dono efetivo da configuração na hierarquia, mantendo leituras não atribuídas e dependências de preparação compartilhada. Também trata valores padrão literais de funções e mudanças isoladas de tipo de retorno da metadata de expressões. O recorte usa apenas observações da suíte no commit fixado.
+
+A v8 experimental também seleciona leitores de constantes locais de módulo quando o valor literal conserva a estrutura e todos os leitores mapeados estão em funções. Importações, acessos externos ou inicialização observada impedem esse recorte. Em arquivos de teste, uma troca isolada da constante esperada no último `self.assertEqual` de um teste preserva os testes que executam seu corpo.
 
 O mapa reúne os testes que passaram por qualquer leitura Python observada, inclusive em código compartilhado. A geração descarta nomes com acesso literal indireto, importação, referências sem cobertura ou leitura durante a coleta. A regra cobre alterações simples de literais, com os demais casos encaminhados à lógica de cobertura da v2 ou à suíte inteira. A análise estática pode deixar de encontrar acessos puramente dinâmicos, por exemplo nomes construídos em tempo de execução.
 
@@ -22,6 +24,7 @@ A coleta adicional registra as classes usadas por cada teste, incluindo suas sup
 | v5, dependências de leitura e preparação compartilhada | 186,307 | 0 |
 | v6, configurações escalares e consumidores de fixtures | 180,484 | 0 |
 | v7, donos de atributos, padrões de funções e metadata | 180,484 | 0 |
+| v8 experimental, constantes locais e asserções finais | 180,484 | 0 |
 
 Em prática, a v5 registrou 559,384 s simulados e zero misses, com 560,7 s oficiais. A v4 registrou 528,624 s de seleção e um miss, para 829,9 s oficiais.
 
@@ -32,6 +35,8 @@ Uma mutação independente de fixture compartilhada pelo executor e pelo otimiza
 Nas 12 mutações independentes com falhas confirmadas, v5 e v6 cobriram todas as falhas. O custo total simulado caiu de 154,817 s para 71,522 s. Na mutação que usa preparação compartilhada, caiu de 25,454 s para 8,901 s. Mudanças com metadados inválidos ainda acionam a seleção compartilhada.
 
 Nas 17 mutações independentes verificadas nesta rodada, v6 e v7 cobriram todas as falhas. O custo simulado total caiu de 255,607 s para 146,326 s. Três mutações com configuração de forma inválida, tipo desconhecido e valor padrão dinâmico mantiveram a suíte inteira.
+
+A v8 experimental cobriu todas as falhas conhecidas em 20 mutações independentes. O custo combinado das três novas mutações caiu de 110,451 s para 11,670 s. A alteração de uma asserção anterior e a introdução de uma chamada na inicialização continuaram a selecionar a suíte inteira.
 
 ## Executar com o kit
 
@@ -53,7 +58,8 @@ python -c 'import gzip,json; p="/profile/"; data=json.loads(gzip.open(p+"attribu
 PYTHON_CPU_COUNT=4 SKIP_INTEGRATION=0 PYTHONPATH=/profile:/src python /profile/profile_classes.py
 python /profile/build_class_map.py /profile/attributes.json.gz /profile/results /profile/classes.json.gz
 python /profile/build_read_map.py /profile/classes.json.gz /profile/results /profile/reads.json.gz
-python /profile/build_owner_map.py /profile/reads.json.gz /profile/results /profile/final.json.gz
+python /profile/build_owner_map.py /profile/reads.json.gz /profile/results /profile/owners.json.gz
+python /profile/build_module_map.py /src /profile/owners.json.gz /profile/final.json.gz
 ```
 
 Copie `/profile/final.json.gz` para a raiz com o nome `impact.json.gz`. Os geradores usam o checkout e as observações do commit fixado. Use uma pasta `/profile/results` vazia para cada coleta.

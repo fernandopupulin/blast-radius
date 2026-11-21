@@ -130,6 +130,8 @@ def literal_shape(value, depth=0):
         raise ValueError("nested configuration value")
     if kind in (tuple, list) and len(value) <= 64:
         return kind, tuple(literal_shape(item, depth + 1) for item in value)
+    if kind is set and len(value) <= 64 and all(type(item) is str for item in value):
+        return kind, len(value)
     if kind is dict and len(value) <= 64 and all(type(key) is str for key in value):
         return kind, tuple((key, literal_shape(item, depth + 1)) for key, item in value.items())
     raise ValueError("unrecognized configuration value")
@@ -149,6 +151,87 @@ def configuration_on_line(body, line):
             if isinstance(target, ast.Name) and node.value is not None and node.lineno <= line <= node.end_lineno:
                 yield node, target.id
         yield from configuration_on_line(definition.body, line)
+
+
+def module_assignment(tree, line):
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and len(node.targets) == 1:
+            target = node.targets[0]
+        elif isinstance(node, ast.AnnAssign):
+            target = node.target
+        else:
+            continue
+        if isinstance(target, ast.Name) and node.value is not None and node.lineno <= line <= node.end_lineno:
+            yield node, target.id
+
+
+def module_literal_readers(before, after, line, readers):
+    old = list(module_assignment(before, line))
+    new = list(module_assignment(after, line))
+    if len(old) != 1 or len(new) != 1:
+        return 0
+    (original, old_name), = old
+    (changed, name), = new
+    if name != old_name or name not in readers:
+        return 0
+    try:
+        if literal_shape(ast.literal_eval(original.value)) != literal_shape(ast.literal_eval(changed.value)):
+            return 0
+    except (TypeError, ValueError):
+        return 0
+    value = changed.value
+    try:
+        changed.value = original.value
+        return int(readers[name], 16) if ast.dump(before) == ast.dump(after) else 0
+    finally:
+        changed.value = value
+
+
+def last_assertion_on_line(tree, line):
+    for function in ast.walk(tree):
+        if not (isinstance(function, ast.FunctionDef) and function.name.startswith("test_")
+                and not function.decorator_list):
+            continue
+        last = function.body[-1]
+        if not isinstance(last, ast.Expr):
+            continue
+        call = last.value
+        if not (isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)
+                and isinstance(call.func.value, ast.Name) and call.func.value.id == "self"
+                and call.func.attr == "assertEqual" and len(call.args) == 2 and not call.keywords):
+            continue
+        expected = call.args[1]
+        if isinstance(expected, ast.Constant) and expected.lineno == expected.end_lineno == line:
+            yield function, call
+
+
+def final_assertion_readers(before, after, line, path, profile):
+    old = list(last_assertion_on_line(before, line))
+    new = list(last_assertion_on_line(after, line))
+    if len(old) != 1 or len(new) != 1:
+        return 0
+    (function, old_call), = old
+    (_, new_call), = new
+    expected = new_call.args[1]
+    if type(expected.value) is not type(old_call.args[1].value):
+        return 0
+    try:
+        new_call.args[1] = old_call.args[1]
+        if ast.dump(before) != ast.dump(after):
+            return 0
+    finally:
+        new_call.args[1] = expected
+    record = profile["files"][path]
+    if any(function.lineno < position <= function.end_lineno for position in record["collection"]):
+        return 0
+    mask = 0
+    for position in range(function.lineno + 1, function.end_lineno + 1):
+        if coverage := record["lines"].get(str(position)):
+            mask |= int(coverage, 16)
+    for idx, test in enumerate(profile["ids"]):
+        if test.partition("::")[0] == path and test.rsplit("::", 1)[-1].split("[", 1)[0] == function.name:
+            mask |= 1 << idx
+    return mask
 
 
 def changed_attribute(path, line, before, after, profile):
@@ -476,6 +559,10 @@ def choose(patch, profile, file_cache):
             line = next(iter(changed))
             readers = changed_attribute(path, line, before, after, profile)
             readers |= class_config_change(path, line, before, after, profile)
+            if path.startswith("tests/"):
+                readers |= final_assertion_readers(before, after, line, path, profile)
+            if module_readers := profile["module_literal_readers"].get(path):
+                readers |= module_literal_readers(before, after, line, module_readers)
             if path.startswith("sqlglot/typing/"):
                 readers |= typing_config_readers(before, after, line, profile)
             if path.startswith("sqlglot/"):
