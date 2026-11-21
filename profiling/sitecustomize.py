@@ -8,6 +8,11 @@ if os.environ.get("BLAST_COMPARE_DISCOVER"):
 
     comparison_observer.install()
 
+if os.environ.get("BLAST_BRANCH_DISCOVER"):
+    import branch_observer
+
+    branch_observer.install()
+
 
 def run_task(context, function, args, kwargs):
     """Attribute each task in a reusable worker to its submitting test."""

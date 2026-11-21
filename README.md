@@ -1,4 +1,4 @@
-# Blast Radius v8
+# Blast Radius v9
 
 A v6 acompanha também os testes que leem os atributos de classe nos quais `setUpClass` armazena pares de SQL. Quando a mudança preserva a estrutura e os metadados que o carregador usa, seleciona esses consumidores e os leitores diretos. Uma mudança que possa afetar a preparação mantém a cobertura compartilhada de toda a classe.
 
@@ -9,6 +9,10 @@ A v7 amplia a substituição de literais para configurações com strings, lista
 A v8 experimental também seleciona leitores de constantes locais de módulo quando o valor literal conserva a estrutura e todos os leitores mapeados estão em funções. Importações, acessos externos ou inicialização observada impedem esse recorte. Em arquivos de teste, uma troca isolada da constante esperada no último `self.assertEqual` de um teste preserva os testes que executam seu corpo.
 
 O perfil de comparações registra apenas os tipos dos operandos que a suíte original executou. Para uma alteração isolada entre identidade e igualdade, com todos os demais nós da AST preservados, esses domínios permitem remover testes de execução normal quando os operadores têm a mesma semântica. São aceitos casos de igualdade padrão de objetos, booleanos canônicos e membros registrados de uma mesma enumeração textual com igualdade nativa. A seleção mantém os leitores diretos do fonte e subprocessos. Domínios mistos sem garantia seguem a cobertura normal.
+
+A v9 também registra os valores booleanos que os operandos de condições assumiram em cada teste. Para uma mudança isolada de operadores booleanos, compara o resultado e a ordem de avaliação dos operandos sob todas as combinações compatíveis com esse perfil. Uma avaliação ausente é tratada como desconhecida. Para comparações entre tipos primitivos exatos, registra as relações de ordem observadas e mantém todos os testes em que a troca de operador possa alterar o resultado. A cobertura inclui as tarefas dos processos filhos. A coleta descarta o recorte por teste quando o mesmo ponto executa fora do corpo de um teste em Python.
+
+A cobertura dos interpretadores iniciados por subprocessos separa os arquivos que a execução importou dos que ficaram fora dela. Mudanças em inicialização ou configuração dos arquivos importados continuam a incluir o teste. A leitura direta de arquivos usa o mapa de dependências observado.
 
 O mapa reúne os testes que passaram por qualquer leitura Python observada, inclusive em código compartilhado. A geração descarta nomes com acesso literal indireto, importação, referências sem cobertura ou leitura durante a coleta. A regra cobre alterações simples de literais, com os demais casos encaminhados à lógica de cobertura da v2 ou à suíte inteira. A análise estática pode deixar de encontrar acessos puramente dinâmicos, por exemplo nomes construídos em tempo de execução.
 
@@ -28,6 +32,7 @@ A coleta adicional registra as classes usadas por cada teste, incluindo suas sup
 | v7, donos de atributos, padrões de funções e metadata | 180,484 | 0 |
 | v8 experimental, constantes locais e asserções finais | 180,484 | 0 |
 | v8, equivalência de comparações pelos tipos observados | 134,611 | 0 |
+| v9, condições por teste e cobertura de subprocessos | 117,803 | 0 |
 
 Em prática, a v5 registrou 559,384 s simulados e zero misses, com 560,7 s oficiais. A v4 registrou 528,624 s de seleção e um miss, para 829,9 s oficiais.
 
@@ -44,6 +49,10 @@ Nas 17 mutações independentes verificadas nesta rodada, v6 e v7 cobriram todas
 A v8 experimental cobriu todas as falhas conhecidas em 20 mutações independentes. O custo combinado das três novas mutações caiu de 110,451 s para 11,670 s. A alteração de uma asserção anterior e a introdução de uma chamada na inicialização continuaram a selecionar a suíte inteira.
 
 A v8 validada com Docker Linux/AMD64 cobriu todas as falhas confirmadas em 21 mutações independentes. O custo simulado combinado caiu de 259,741 s na v7 para 160,960 s. A troca de igualdade por identidade em uma comparação de datas preservou a seleção do teste que falhava.
+
+A v9 cobriu as mesmas 21 mutações com 156,407 s simulados de custo combinado e zero misses. No kit, cinco mudanças prescindiram de workers, graças à equivalência de comparações e à cobertura do interpretador isolado.
+
+Mais nove mutações foram executadas com a suíte completa. A v9 cobriu todas as falhas e reduziu o custo desse grupo de 194,827 s na v8 para 188,970 s. Nas trocas comportamentalmente equivalentes de condição e limite trimestral, selecionou zero workers. Uma importação antecipada de dialeto ainda selecionou o teste do interpretador isolado que falhou.
 
 ## Executar com o kit
 
@@ -76,6 +85,15 @@ BLAST_COMPARE_DISCOVER=1 PYTHON_CPU_COUNT=4 SKIP_INTEGRATION=0 PYTHONPATH=/profi
 python /profile/build_comparison_map.py /profile/modules.json.gz /profile/results /profile/final.json.gz
 ```
 
-Copie `/profile/final.json.gz` para a raiz com o nome `impact.json.gz`. Os geradores usam o checkout e as observações do commit fixado. Use uma pasta `/profile/results` vazia para cada coleta.
+Mantenha os perfis de `/profile/children` da coleta de cobertura. Mova os resultados anteriores e recrie `/profile/results` vazio antes de coletar condições e relações de ordem.
+
+```sh
+python /profile/build_subprocess_map.py /profile/final.json.gz /profile/children /profile/subprocess.json.gz
+BLAST_BRANCH_DISCOVER=1 PYTHON_CPU_COUNT=4 SKIP_INTEGRATION=0 PYTHONPATH=/profile:/src \
+  python -c 'import branch_observer; raise SystemExit(branch_observer.main())'
+python /profile/build_branch_map.py /profile/subprocess.json.gz /profile/results /profile/release.json.gz
+```
+
+Copie `/profile/release.json.gz` para a raiz com o nome `impact.json.gz`. Os geradores usam o checkout e as observações do commit fixado. Use uma pasta `/profile/results` vazia para cada coleta.
 
 Em uma segunda validação independente, alterei `BigQuery.WEEK_OFFSET` de −1 para 0 e rodei a suíte completa. Dez subtestes falharam dentro de `tests/test_optimizer.py::TestOptimizer::test_simplify`, que vale como um teste no scorer. A v3 incluiu esse teste entre os 10 que selecionou.

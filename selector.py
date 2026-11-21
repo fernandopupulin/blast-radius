@@ -268,7 +268,7 @@ def changed_attribute(path, line, before, after, profile):
 def expression_on_line(tree, line):
     matches = []
     for node in ast.walk(tree):
-        if isinstance(node, ast.If):
+        if isinstance(node, (ast.If, ast.While)):
             field = "test"
         elif isinstance(node, (ast.Assign, ast.Return)):
             field = "value"
@@ -436,7 +436,7 @@ def class_config_change(path, line, before, after, profile):
     try:
         new.values[new_index] = old_value
         if ast.dump(before) == ast.dump(after):
-            return int(observed, 16) | int(profile["subprocess_users"], 16)
+            return int(observed, 16)
     finally:
         new.values[new_index] = new_value
     return 0
@@ -530,6 +530,24 @@ def comparisons_on_line(tree, line):
     ]
 
 
+def changed_comparison(line, before, after):
+    old = comparisons_on_line(before, line)
+    new = comparisons_on_line(after, line)
+    if len(old) != len(new):
+        return None
+    changed = [(a, b) for a, b in zip(old, new) if type(a.ops[0]) is not type(b.ops[0])]
+    if len(changed) != 1:
+        return None
+    a, b = changed[0]
+    replacement = b.ops[0]
+    try:
+        b.ops[0] = a.ops[0]
+        if ast.dump(before) == ast.dump(after):
+            return a, b
+    finally:
+        b.ops[0] = replacement
+
+
 def identity_and_equality_match(left, right):
     identity_types = {"identity", "none"}
     return (
@@ -538,31 +556,118 @@ def identity_and_equality_match(left, right):
     )
 
 
-def equivalent_comparison(path, line, before, after, observed):
-    old = comparisons_on_line(before, line)
-    new = comparisons_on_line(after, line)
-    if len(old) != 1 or len(new) != 1:
-        return False
-    a, = old
-    b, = new
+def equivalent_comparison(path, a, b, observed):
     operations = {type(a.ops[0]), type(b.ops[0])}
     if operations not in ({ast.Is, ast.Eq}, {ast.IsNot, ast.NotEq}):
         return False
     domains = observed.get(f"{path}:{a.lineno}:{a.col_offset}")
-    if not domains or not all(identity_and_equality_match(*pair) for pair in domains):
-        return False
-    replacement = b.ops[0]
+    return bool(domains) and all(identity_and_equality_match(*pair) for pair in domains)
+
+
+def branch_signature(expression, *, condition):
+    atoms = []
+
+    def describe(node):
+        if isinstance(node, ast.BoolOp):
+            operator = "and" if isinstance(node.op, ast.And) else "or"
+            return operator, tuple(map(describe, node.values))
+        if condition and isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+            return "not", describe(node.operand)
+        atoms.append(ast.dump(node))
+        return len(atoms) - 1
+
+    return describe(expression), atoms
+
+
+def evaluate_branch(branch, assignment, trace):
+    if isinstance(branch, int):
+        trace.append(branch)
+        return bool(assignment & (1 << branch))
+    operator, children = branch
+    if operator == "not":
+        return not evaluate_branch(children, assignment, trace)
+    values = (evaluate_branch(child, assignment, trace) for child in children)
+    return all(values) if operator == "and" else any(values)
+
+
+def equivalent_branch_tests(path, line, before, after, observed):
+    old = expression_on_line(before, line)
+    new = expression_on_line(after, line)
+    if len(old) != 1 or len(new) != 1:
+        return 0
+    _, old_field, original = old[0]
+    node, field, replacement = new[0]
+    if old_field != field:
+        return 0
+    domains = observed.get(f"{path}:{original.lineno}:{original.col_offset}")
+    if not domains:
+        return 0
+    old_branch, old_atoms = branch_signature(original, condition=field == "test")
+    new_branch, new_atoms = branch_signature(replacement, condition=field == "test")
+    if old_atoms != new_atoms or len(old_atoms) > 12:
+        return 0
+    setattr(node, field, original)
     try:
-        b.ops[0] = a.ops[0]
-        return ast.dump(before) == ast.dump(after)
+        if ast.dump(before) != ast.dump(after):
+            return 0
     finally:
-        b.ops[0] = replacement
+        setattr(node, field, replacement)
+    differences = []
+    for assignment in range(1 << len(old_atoms)):
+        old_trace, new_trace = [], []
+        old_result = evaluate_branch(old_branch, assignment, old_trace)
+        new_result = evaluate_branch(new_branch, assignment, new_trace)
+        if old_result != new_result or old_trace != new_trace:
+            requirements = sum(
+                1 << (2 * index + bool(assignment & (1 << index)))
+                for index in range(len(old_atoms))
+            )
+            differences.append(requirements)
+    unaffected = 0
+    for domain, matching_tests in domains:
+        # An unobserved truth value is unconstrained, including when
+        # evaluation stopped at an exception before it could be recorded.
+        possible = domain
+        for index in range(len(old_atoms)):
+            pair = 3 << (2 * index)
+            if not possible & pair:
+                possible |= pair
+        if not any(possible & requirements == requirements for requirements in differences):
+            unaffected |= int(matching_tests, 16)
+    return unaffected
+
+
+COMPARISON_TRUE_RELATIONS = {
+    ast.Lt: 0b0001,
+    ast.Gt: 0b0010,
+    ast.Eq: 0b0100,
+    ast.LtE: 0b0101,
+    ast.GtE: 0b0110,
+    ast.NotEq: 0b1011,
+}
+
+
+def equivalent_order_tests(path, a, b, observed):
+    old_truth = COMPARISON_TRUE_RELATIONS.get(type(a.ops[0]))
+    new_truth = COMPARISON_TRUE_RELATIONS.get(type(b.ops[0]))
+    if old_truth is None or new_truth is None or old_truth == new_truth:
+        return 0
+    domains = observed.get(f"{path}:{a.lineno}:{a.col_offset}")
+    if not domains:
+        return 0
+    different_or_unsupported = (old_truth ^ new_truth) | 0b10000
+    unaffected = 0
+    for domain, matching_tests in domains:
+        if not domain & different_or_unsupported:
+            unaffected |= int(matching_tests, 16)
+    return unaffected
 
 
 def choose(patch, profile, file_cache):
     selected = 0
     nearby = 0
     files = sections(patch)
+    untraced_subprocesses = int(profile["subprocess_users"], 16) & ~int(profile["subprocess_traced"], 16)
     for path, section in files.items():
         source = profile["sources"][path]
         updated, changed, inserted = apply_section(
@@ -579,7 +684,8 @@ def choose(patch, profile, file_cache):
             continue
 
         selected |= int(profile["file_reads"].get(path, "0"), 16)
-        selected |= int(profile["subprocess_users"], 16)
+        selected |= untraced_subprocesses
+        subprocess_file_users = int(profile["subprocess_files"].get(path, "0"), 16)
         before = ast.parse(source, filename=path, type_comments=True)
         after = ast.parse(updated, filename=path, type_comments=True)
         compile(after, path, "exec")
@@ -593,9 +699,9 @@ def choose(patch, profile, file_cache):
             and changed == inserted
             and source.count("\n") == updated.count("\n")
         )
-        if (one_line and len(files) == 1 and path.startswith("sqlglot/")
-                and equivalent_comparison(path, next(iter(changed)), before, after,
-                                          profile["comparison_operand_types"])):
+        single_source_edit = one_line and len(files) == 1 and path.startswith("sqlglot/")
+        comparison = changed_comparison(next(iter(changed)), before, after) if single_source_edit else None
+        if comparison and equivalent_comparison(path, *comparison, profile["comparison_operand_types"]):
             continue
         nearby |= file_users(path, profile, file_cache)
         if one_line:
@@ -613,9 +719,16 @@ def choose(patch, profile, file_cache):
                     before, after, line, profile["files"][path], profile["default_reflection_readers"]
                 )
             if readers:
-                selected |= readers
+                selected |= readers | subprocess_file_users
                 continue
         isolated = one_line and isolated_expression_change(before, after, next(iter(changed)))
+        unaffected = 0
+        if comparison:
+            unaffected = equivalent_order_tests(path, *comparison, profile["comparison_relations"])
+        if isolated and single_source_edit:
+            unaffected |= equivalent_branch_tests(
+                path, next(iter(changed)), before, after, profile["branch_truth_domains"]
+            )
         if path.startswith("tests/") or module_structure(before) != module_structure(after):
             raise ValueError("test code or module-level behavior changed")
         coverage = profile["files"][path]
@@ -643,7 +756,7 @@ def choose(patch, profile, file_cache):
                     if value := coverage["lines"].get(str(position)):
                         reached |= int(value, 16)
                 if reached:
-                    scope_mask |= reached
+                    scope_mask |= reached & ~unaffected
                     continue
             measured = 0
             for number in range(start, end + 1):
@@ -657,7 +770,7 @@ def choose(patch, profile, file_cache):
                 if not class_mask:
                     raise ValueError("scope has no measured tests")
                 measured = int(class_mask, 16)
-            scope_mask |= measured
+            scope_mask |= measured & ~unaffected
         selected |= scope_mask
     return selected, nearby
 
