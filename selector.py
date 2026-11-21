@@ -6,6 +6,7 @@ import json
 import math
 from pathlib import Path
 import re
+from types import CodeType
 
 DATA = Path("/data")
 MAP = Path(__file__).with_name("impact.json.gz")
@@ -118,6 +119,17 @@ def module_structure(tree):
             return node
 
     return ast.dump(StripBodies().visit(tree))
+
+
+def lexical_layout(code):
+    return (
+        code.co_qualname,
+        code.co_flags,
+        code.co_varnames,
+        code.co_cellvars,
+        code.co_freevars,
+        tuple(lexical_layout(item) for item in code.co_consts if isinstance(item, CodeType)),
+    )
 
 
 def literal_shape(value, depth=0):
@@ -314,7 +326,7 @@ def defaults_on_line(tree, line):
                     yield node, defaults, index
 
 
-def default_value_readers(before, after, line, record, reflection):
+def default_value_readers(path, before, after, line, record, reflection, explicit_arguments):
     if reflection is None:
         return 0
     old = list(defaults_on_line(before, line))
@@ -344,7 +356,17 @@ def default_value_readers(before, after, line, record, reflection):
     for number in range(start, function.end_lineno + 1):
         if mask := record["lines"].get(str(number)):
             observed |= int(mask, 16)
-    return (observed | int(reflection, 16)) if observed else 0
+    args = function.args
+    if old_values is args.kw_defaults:
+        parameter = args.kwonlyargs[index]
+    else:
+        positions = (*args.posonlyargs, *args.args)
+        parameter = positions[len(positions) - len(args.defaults) + index]
+    site = f"{path}:{function.lineno}:{function.col_offset}:{parameter.arg}"
+    explicit_mask = int(explicit_arguments.get(site, "0"), 16)
+    if observed:
+        return (observed & ~explicit_mask) | int(reflection, 16)
+    return 0
 
 
 def enclosing_class(body, line, owner=()):
@@ -408,15 +430,15 @@ def class_config_change(path, line, before, after, profile):
     old_entries = {entry[:3]: entry[3:] for entry in class_dict_entries(before.body, line)}
     new_entries = {entry[:3]: entry[3:] for entry in class_dict_entries(after.body, line)}
     if old_entries.keys() != new_entries.keys():
-        return 0
+        return None
     updates = []
     for key, (old, old_index) in old_entries.items():
         new, new_index = new_entries[key]
         if ast.dump(old.values[old_index]) != ast.dump(new.values[new_index]):
             updates.append((key, old.values[old_index], new, new_index))
     if len(updates) != 1:
-        return 0
-    (owner, attribute, _), old_value, new, new_index = updates[0]
+        return None
+    (owner, attribute, key), old_value, new, new_index = updates[0]
     new_value = new.values[new_index]
     if attribute == "arg_types" and path.startswith("sqlglot/expressions/"):
         valid = all(isinstance(node, ast.Constant) and type(node.value) is bool
@@ -426,20 +448,22 @@ def class_config_change(path, line, before, after, profile):
     elif attribute == "SHOW_PARSERS" and path.startswith("sqlglot/parsers/"):
         valid = show_factory(old_value) is not None and show_factory(new_value) is not None
     else:
-        return 0
+        return None
     if not valid:
-        return 0
+        return None
     module = path.removesuffix(".py").replace("/", ".")
     observed = profile["class_users"].get(f"{module}:{owner}")
-    if not observed:
-        return 0
     try:
         new.values[new_index] = old_value
         if ast.dump(before) == ast.dump(after):
-            return int(observed, 16)
+            table = profile["dispatch_tables"].get(f"{path}:{owner}:{attribute}")
+            if table is not None and (readers := table.get(key, "0")) is not None:
+                return int(readers, 16)
+            if observed:
+                return int(observed, 16)
     finally:
         new.values[new_index] = new_value
-    return 0
+    return None
 
 
 def expression_attribute(node):
@@ -688,7 +712,7 @@ def choose(patch, profile, file_cache):
         subprocess_file_users = int(profile["subprocess_files"].get(path, "0"), 16)
         before = ast.parse(source, filename=path, type_comments=True)
         after = ast.parse(updated, filename=path, type_comments=True)
-        compile(after, path, "exec")
+        compiled = compile(after, path, "exec", dont_inherit=True)
         if ast.dump(before) == ast.dump(after):
             # Position-only edits can matter to introspection, but ordinary
             # comments do not alter the parsed program or its type directives.
@@ -706,8 +730,11 @@ def choose(patch, profile, file_cache):
         nearby |= file_users(path, profile, file_cache)
         if one_line:
             line = next(iter(changed))
+            table_readers = class_config_change(path, line, before, after, profile)
+            if table_readers is not None:
+                selected |= table_readers | subprocess_file_users
+                continue
             readers = changed_attribute(path, line, before, after, profile)
-            readers |= class_config_change(path, line, before, after, profile)
             if path.startswith("tests/"):
                 readers |= final_assertion_readers(before, after, line, path, profile)
             if module_readers := profile["module_literal_readers"].get(path):
@@ -716,7 +743,8 @@ def choose(patch, profile, file_cache):
                 readers |= typing_config_readers(before, after, line, profile)
             if path.startswith("sqlglot/"):
                 readers |= default_value_readers(
-                    before, after, line, profile["files"][path], profile["default_reflection_readers"]
+                    path, before, after, line, profile["files"][path], profile["default_reflection_readers"],
+                    profile["explicit_default_arguments"]
                 )
             if readers:
                 selected |= readers | subprocess_file_users
@@ -748,16 +776,30 @@ def choose(patch, profile, file_cache):
             # An edit near a nested definition can affect its enclosing function
             # even when the nested function itself was never called.
             _, start, end = max(candidates, key=lambda scope: scope[2] - scope[0])
-            if any(start <= number <= end for number in coverage["collection"]):
-                raise ValueError("function runs during test collection")
+            collected = any(start <= number <= end for number in coverage["collection"])
             if isolated:
                 reached = 0
+                unattributed = False
                 for position in isolated:
-                    if value := coverage["lines"].get(str(position)):
+                    value = coverage["lines"].get(str(position))
+                    if value:
                         reached |= int(value, 16)
-                if reached:
+                    elif value is not None:
+                        unattributed = True
+                exact_runtime = (
+                    not unattributed
+                    and not any(position in coverage["collection"] for position in isolated)
+                )
+                if not collected and reached:
                     scope_mask |= reached & ~unaffected
                     continue
+                if exact_runtime:
+                    baseline = compile(source, path, "exec", dont_inherit=True)
+                    if lexical_layout(baseline) == lexical_layout(compiled):
+                        scope_mask |= reached & ~unaffected
+                        continue
+            if collected:
+                raise ValueError("function runs during test collection")
             measured = 0
             for number in range(start, end + 1):
                 value = coverage["lines"].get(str(number))

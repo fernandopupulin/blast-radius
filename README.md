@@ -1,4 +1,4 @@
-# Blast Radius v9
+# Blast Radius v11
 
 A v6 acompanha também os testes que leem os atributos de classe nos quais `setUpClass` armazena pares de SQL. Quando a mudança preserva a estrutura e os metadados que o carregador usa, seleciona esses consumidores e os leitores diretos. Uma mudança que possa afetar a preparação mantém a cobertura compartilhada de toda a classe.
 
@@ -13,6 +13,10 @@ O perfil de comparações registra apenas os tipos dos operandos que a suíte or
 A v9 também registra os valores booleanos que os operandos de condições assumiram em cada teste. Para uma mudança isolada de operadores booleanos, compara o resultado e a ordem de avaliação dos operandos sob todas as combinações compatíveis com esse perfil. Uma avaliação ausente é tratada como desconhecida. Para comparações entre tipos primitivos exatos, registra as relações de ordem observadas e mantém todos os testes em que a troca de operador possa alterar o resultado. A cobertura inclui as tarefas dos processos filhos. A coleta descarta o recorte por teste quando o mesmo ponto executa fora do corpo de um teste em Python.
 
 A cobertura dos interpretadores iniciados por subprocessos separa os arquivos que a execução importou dos que ficaram fora dela. Mudanças em inicialização ou configuração dos arquivos importados continuam a incluir o teste. A leitura direta de arquivos usa o mapa de dependências observado.
+
+A última versão rastreia o consumo das entradas de despacho de SHOW e de escapes numéricos, inclusive quando a tabela de despacho é copiada para uma subclasse. Uma edição isolada precisa preservar as chaves e corresponder à estrutura de uma configuração conhecida. Para argumentos padrão imutáveis, a coleta identifica chamadas que sempre receberam um valor distinto do padrão original.
+
+Uma edição isolada de expressão pode usar sua cobertura durante a execução mesmo quando a função que a contém também é chamada durante a coleta. O seletor exige que as linhas da expressão tenham cobertura atribuída ou permaneçam sem execução, que a coleta não execute a expressão e que a compilação preserve a estrutura dos escopos léxicos. Mudanças fora dessas condições seguem a seleção conservadora.
 
 O mapa reúne os testes que passaram por qualquer leitura Python observada, inclusive em código compartilhado. A geração descarta nomes com acesso literal indireto, importação, referências sem cobertura ou leitura durante a coleta. A regra cobre alterações simples de literais, com os demais casos encaminhados à lógica de cobertura da v2 ou à suíte inteira. A análise estática pode deixar de encontrar acessos puramente dinâmicos, por exemplo nomes construídos em tempo de execução.
 
@@ -33,6 +37,8 @@ A coleta adicional registra as classes usadas por cada teste, incluindo suas sup
 | v8 experimental, constantes locais e asserções finais | 180,484 | 0 |
 | v8, equivalência de comparações pelos tipos observados | 134,611 | 0 |
 | v9, condições por teste e cobertura de subprocessos | 117,803 | 0 |
+| v10 experimental, entradas de tabelas e argumentos padrão | 106,505 | 0 |
+| v11, cobertura de expressões e escopos léxicos | 104,474 | 0 |
 
 Em prática, a v5 registrou 559,384 s simulados e zero misses, com 560,7 s oficiais. A v4 registrou 528,624 s de seleção e um miss, para 829,9 s oficiais.
 
@@ -53,6 +59,8 @@ A v8 validada com Docker Linux/AMD64 cobriu todas as falhas confirmadas em 21 mu
 A v9 cobriu as mesmas 21 mutações com 156,407 s simulados de custo combinado e zero misses. No kit, cinco mudanças prescindiram de workers, graças à equivalência de comparações e à cobertura do interpretador isolado.
 
 Mais nove mutações foram executadas com a suíte completa. A v9 cobriu todas as falhas e reduziu o custo desse grupo de 194,827 s na v8 para 188,970 s. Nas trocas comportamentalmente equivalentes de condição e limite trimestral, selecionou zero workers. Uma importação antecipada de dialeto ainda selecionou o teste do interpretador isolado que falhou.
+
+A v11 cobriu todas as falhas verificadas nas 30 mutações. O custo combinado caiu de 345,377 s na v9 para 270,965 s. No caso de despacho MySQL, o custo caiu de 25,454 s para 2,018 s. A mudança no limite de nós do parser manteve o teste que falhou e custou 30,819 s.
 
 ## Executar com o kit
 

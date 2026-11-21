@@ -17,6 +17,10 @@ ROOT = Path.cwd()
 PROBE = "__blast_radius_branch_profile__"
 VALUE_PROBE = "__blast_radius_branch_value_profile__"
 COMPARE_PROBE = "__blast_radius_order_profile__"
+REGISTER = "__blast_radius_register_table__"
+LOOKUP_ESCAPE = "__blast_radius_lookup_escape__"
+LOOKUP_PARSER = "__blast_radius_lookup_parser__"
+DEFAULT_PROBE = "__blast_radius_bound_default__"
 COMPARE_OPERATORS = {
     ast.Lt: "<", ast.LtE: "<=", ast.Gt: ">", ast.GtE: ">=", ast.Eq: "==", ast.NotEq: "!=",
 }
@@ -28,6 +32,9 @@ active = set()
 per_test = {}
 outside = set()
 non_boolean = set()
+registered = set()
+numeric_tables = {}
+parser_functions = {}
 test_context = ""
 submit = ProcessPoolExecutor.submit
 child_pid = None
@@ -65,9 +72,85 @@ def compare(site, operation, left, right):
     return COMPARE_FUNCTIONS[operation](left, right)
 
 
+def register(owner, name, keys, table):
+    registered.add(owner)
+    if name == "NUMERIC_ESCAPES":
+        numeric_tables[id(table)] = (table, owner)
+    else:
+        for key in keys:
+            value = table[key]
+            item = parser_functions.setdefault(id(value), (value, set()))
+            item[1].add(f"{owner}:{key}")
+    return table
+
+
+def lookup_escape(table, key):
+    value = table.get(key)
+    if value is not None and (entry := numeric_tables.get(id(table))):
+        active.add((f"{entry[1]}:{key}", 0))
+    return value
+
+
+def lookup_parser(table, key):
+    value = table[key]
+    if entry := parser_functions.get(id(value)):
+        active.update((site, 0) for site in entry[1])
+    return value
+
+
+def observe_default(site, bound, default):
+    explicit_difference = type(bound) is not type(default) or bound != default
+    active.add((site, int(explicit_difference)))
+
+
 class Instrument(ast.NodeTransformer):
     def __init__(self, path):
         self.path = path
+        self.owner = []
+
+    def visit_ClassDef(self, node):
+        self.owner.append(node.name)
+        self.generic_visit(node)
+        for statement in node.body:
+            if isinstance(statement, ast.Assign) and len(statement.targets) == 1:
+                target = statement.targets[0]
+            elif isinstance(statement, ast.AnnAssign):
+                target = statement.target
+            else:
+                continue
+            if not (isinstance(target, ast.Name) and target.id in ("NUMERIC_ESCAPES", "SHOW_PARSERS")
+                    and isinstance(statement.value, ast.Dict)):
+                continue
+            keys = tuple(key.value for key in statement.value.keys
+                         if isinstance(key, ast.Constant) and type(key.value) is str)
+            owner = f"R{self.path}:{'.'.join(self.owner)}:{target.id}"
+            original = statement.value
+            statement.value = self.wrap(REGISTER, original, ast.Constant(owner),
+                                        ast.Constant(target.id), ast.Constant(keys), original)
+        self.owner.pop()
+        return node
+
+    @staticmethod
+    def wrap(probe, node, *args):
+        return ast.copy_location(ast.Call(
+            func=ast.Name(id=probe, ctx=ast.Load()), args=list(args), keywords=[]
+        ), node)
+
+    def visit_Call(self, node):
+        self.generic_visit(node)
+        function = node.func
+        if (self.path == "sqlglot/tokenizer_core.py" and isinstance(function, ast.Attribute)
+                and function.attr == "get" and len(node.args) == 1 and not node.keywords
+                and isinstance(function.value, ast.Attribute) and function.value.attr == "numeric_escapes"):
+            return self.wrap(LOOKUP_ESCAPE, node, function.value, *node.args)
+        return node
+
+    def visit_Subscript(self, node):
+        self.generic_visit(node)
+        if (self.path == "sqlglot/parser.py" and isinstance(node.value, ast.Name)
+                and node.value.id == "parsers" and isinstance(node.ctx, ast.Load)):
+            return self.wrap(LOOKUP_PARSER, node, node.value, node.slice)
+        return node
 
     def visit_If(self, node):
         self.generic_visit(node)
@@ -82,6 +165,37 @@ class Instrument(ast.NodeTransformer):
         return node
 
     visit_Assign = visit_Return
+
+    def visit_FunctionDef(self, node):
+        self.generic_visit(node)
+        if any(not isinstance(decorator, ast.Name) or decorator.id not in {"classmethod", "staticmethod"}
+               for decorator in node.decorator_list):
+            return node
+        args = node.args
+        positional = (*args.posonlyargs, *args.args)
+        candidates = list(zip(positional[len(positional) - len(args.defaults):], args.defaults))
+        candidates.extend(zip(args.kwonlyargs, args.kw_defaults))
+        probes = []
+        for argument, default in candidates:
+            if default is None:
+                continue
+            try:
+                baseline = ast.literal_eval(default)
+            except (TypeError, ValueError):
+                continue
+            if type(baseline) not in (bool, int, str):
+                continue
+            site = f"D{self.path}:{node.lineno}:{node.col_offset}:{argument.arg}"
+            probes.append(ast.Expr(self.wrap(DEFAULT_PROBE, node.body[0], ast.Constant(site),
+                                            ast.Name(id=argument.arg, ctx=ast.Load()),
+                                            ast.Constant(baseline))))
+        start = 1 if ast.get_docstring(node) is not None else 0
+        for probe in probes:
+            ast.copy_location(probe, node.body[min(start, len(node.body) - 1)])
+        node.body[start:start] = probes
+        return node
+
+    visit_AsyncFunctionDef = visit_FunctionDef
 
     def visit_Compare(self, node):
         self.generic_visit(node)
@@ -126,6 +240,10 @@ class Loader(SourceFileLoader):
         module.__dict__[PROBE] = observe
         module.__dict__[VALUE_PROBE] = observe_value
         module.__dict__[COMPARE_PROBE] = compare
+        module.__dict__[REGISTER] = register
+        module.__dict__[LOOKUP_ESCAPE] = lookup_escape
+        module.__dict__[LOOKUP_PARSER] = lookup_parser
+        module.__dict__[DEFAULT_PROBE] = observe_default
         return super().exec_module(module)
 
     def get_code(self, fullname):
@@ -191,7 +309,8 @@ def pytest_sessionfinish():
 
 def save():
     path = Path(f"/profile/results/{os.getpid()}.json.gz")
-    data = {"tests": per_test, "outside": sorted(non_boolean | {site for site, _ in outside})}
+    data = {"tests": per_test, "outside": sorted(non_boolean | {site for site, _ in outside}),
+            "registered": sorted(registered)}
     path.write_bytes(gzip.compress(json.dumps(data, separators=(",", ":")).encode(), mtime=0))
 
 

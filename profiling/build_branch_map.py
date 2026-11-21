@@ -11,11 +11,13 @@ def main(mapping, traces, output):
     profile = json.loads(gzip.decompress(Path(mapping).read_bytes()))
     bits = {name: 1 << index for index, name in enumerate(profile["ids"])}
     outside = set()
+    registries = set()
     tests = defaultdict(dict)
     files = sorted(Path(traces).glob("*.json.gz"))
     for path in files:
         observations = json.loads(gzip.decompress(path.read_bytes()))
         outside.update(observations["outside"])
+        registries.update(observations["registered"])
         for test, vectors in observations["tests"].items():
             for site, domain in vectors.items():
                 tests[test][site] = tests[test].get(site, 0) | domain
@@ -29,11 +31,21 @@ def main(mapping, traces, output):
                 sites[site][domain] |= bit
     profile["branch_truth_domains"] = {
         site: [[domain, f"{mask:x}"] for domain, mask in sorted(groups.items())]
-        for site, groups in sorted(sites.items()) if not site.startswith("C")
+        for site, groups in sorted(sites.items()) if not site.startswith(("C", "R", "D"))
     }
     profile["comparison_relations"] = {
         site[1:]: [[domain, f"{mask:x}"] for domain, mask in sorted(groups.items())]
         for site, groups in sorted(sites.items()) if site.startswith("C")
+    }
+    profile["dispatch_tables"] = {owner[1:]: {} for owner in sorted(registries)}
+    for site in sorted(set(sites).union(outside)):
+        if site.startswith("R"):
+            owner, _, key = site[1:].rpartition(":")
+            readers = None if site in outside else f"{sites[site][1]:x}"
+            profile["dispatch_tables"][owner][key] = readers
+    profile["explicit_default_arguments"] = {
+        site[1:]: f"{groups[2]:x}" for site, groups in sorted(sites.items())
+        if site.startswith("D") and groups.get(2)
     }
     data = json.dumps(profile, separators=(",", ":")).encode()
     Path(output).write_bytes(gzip.compress(data, mtime=0))
