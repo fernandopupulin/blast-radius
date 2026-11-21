@@ -3,6 +3,11 @@
 import os
 import coverage
 
+if os.environ.get("BLAST_COMPARE_DISCOVER"):
+    import comparison_observer
+
+    comparison_observer.install()
+
 
 def run_task(context, function, args, kwargs):
     """Attribute each task in a reusable worker to its submitting test."""

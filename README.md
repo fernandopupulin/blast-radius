@@ -1,4 +1,4 @@
-# Blast Radius v8 experimental
+# Blast Radius v8
 
 A v6 acompanha também os testes que leem os atributos de classe nos quais `setUpClass` armazena pares de SQL. Quando a mudança preserva a estrutura e os metadados que o carregador usa, seleciona esses consumidores e os leitores diretos. Uma mudança que possa afetar a preparação mantém a cobertura compartilhada de toda a classe.
 
@@ -7,6 +7,8 @@ Para Python, uma troca isolada de uma expressão executável em uma linha pode u
 A v7 amplia a substituição de literais para configurações com strings, listas, tuplas e dicionários de estrutura preservada. Quando possível, atribui a leitura ao dono efetivo da configuração na hierarquia, mantendo leituras não atribuídas e dependências de preparação compartilhada. Também trata valores padrão literais de funções e mudanças isoladas de tipo de retorno da metadata de expressões. O recorte usa apenas observações da suíte no commit fixado.
 
 A v8 experimental também seleciona leitores de constantes locais de módulo quando o valor literal conserva a estrutura e todos os leitores mapeados estão em funções. Importações, acessos externos ou inicialização observada impedem esse recorte. Em arquivos de teste, uma troca isolada da constante esperada no último `self.assertEqual` de um teste preserva os testes que executam seu corpo.
+
+O perfil de comparações registra apenas os tipos dos operandos que a suíte original executou. Para uma alteração isolada entre identidade e igualdade, com todos os demais nós da AST preservados, esses domínios permitem remover testes de execução normal quando os operadores têm a mesma semântica. São aceitos casos de igualdade padrão de objetos, booleanos canônicos e membros registrados de uma mesma enumeração textual com igualdade nativa. A seleção mantém os leitores diretos do fonte e subprocessos. Domínios mistos sem garantia seguem a cobertura normal.
 
 O mapa reúne os testes que passaram por qualquer leitura Python observada, inclusive em código compartilhado. A geração descarta nomes com acesso literal indireto, importação, referências sem cobertura ou leitura durante a coleta. A regra cobre alterações simples de literais, com os demais casos encaminhados à lógica de cobertura da v2 ou à suíte inteira. A análise estática pode deixar de encontrar acessos puramente dinâmicos, por exemplo nomes construídos em tempo de execução.
 
@@ -25,10 +27,13 @@ A coleta adicional registra as classes usadas por cada teste, incluindo suas sup
 | v6, configurações escalares e consumidores de fixtures | 180,484 | 0 |
 | v7, donos de atributos, padrões de funções e metadata | 180,484 | 0 |
 | v8 experimental, constantes locais e asserções finais | 180,484 | 0 |
+| v8, equivalência de comparações pelos tipos observados | 134,611 | 0 |
 
 Em prática, a v5 registrou 559,384 s simulados e zero misses, com 560,7 s oficiais. A v4 registrou 528,624 s de seleção e um miss, para 829,9 s oficiais.
 
 A v6 marcou 549,0 s oficiais, com 547,613 s simulados, 1,42 s de CPU mediana e zero misses.
+
+A v7 marcou 549,2 s oficiais, com os mesmos 547,613 s simulados, CPU mediana de 1,55 s e zero misses.
 
 Uma mutação independente de fixture compartilhada pelo executor e pelo otimizador reproduziu uma falha omitida pela v4. A v5 recuperou essa falha e incluiu todas as demais falhas registradas pela suíte completa para essa mutação.
 
@@ -37,6 +42,8 @@ Nas 12 mutações independentes com falhas confirmadas, v5 e v6 cobriram todas a
 Nas 17 mutações independentes verificadas nesta rodada, v6 e v7 cobriram todas as falhas. O custo simulado total caiu de 255,607 s para 146,326 s. Três mutações com configuração de forma inválida, tipo desconhecido e valor padrão dinâmico mantiveram a suíte inteira.
 
 A v8 experimental cobriu todas as falhas conhecidas em 20 mutações independentes. O custo combinado das três novas mutações caiu de 110,451 s para 11,670 s. A alteração de uma asserção anterior e a introdução de uma chamada na inicialização continuaram a selecionar a suíte inteira.
+
+A v8 validada com Docker Linux/AMD64 cobriu todas as falhas confirmadas em 21 mutações independentes. O custo simulado combinado caiu de 259,741 s na v7 para 160,960 s. A troca de igualdade por identidade em uma comparação de datas preservou a seleção do teste que falhava.
 
 ## Executar com o kit
 
@@ -59,7 +66,14 @@ PYTHON_CPU_COUNT=4 SKIP_INTEGRATION=0 PYTHONPATH=/profile:/src python /profile/p
 python /profile/build_class_map.py /profile/attributes.json.gz /profile/results /profile/classes.json.gz
 python /profile/build_read_map.py /profile/classes.json.gz /profile/results /profile/reads.json.gz
 python /profile/build_owner_map.py /profile/reads.json.gz /profile/results /profile/owners.json.gz
-python /profile/build_module_map.py /src /profile/owners.json.gz /profile/final.json.gz
+python /profile/build_module_map.py /src /profile/owners.json.gz /profile/modules.json.gz
+```
+
+Para coletar comparações, mova os JSONs de `/profile/results` para uma pasta separada e recrie esse diretório vazio. Rode a mesma suíte com o observador de tipos e acrescente as observações ao mapa.
+
+```sh
+BLAST_COMPARE_DISCOVER=1 PYTHON_CPU_COUNT=4 SKIP_INTEGRATION=0 PYTHONPATH=/profile:/src python -m pytest tests -q
+python /profile/build_comparison_map.py /profile/modules.json.gz /profile/results /profile/final.json.gz
 ```
 
 Copie `/profile/final.json.gz` para a raiz com o nome `impact.json.gz`. Os geradores usam o checkout e as observações do commit fixado. Use uma pasta `/profile/results` vazia para cada coleta.

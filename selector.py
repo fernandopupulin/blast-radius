@@ -522,10 +522,48 @@ def fixture_metadata(source):
     return len(statements), metadata
 
 
+def comparisons_on_line(tree, line):
+    return [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Compare) and len(node.ops) == 1
+        and node.lineno <= line <= node.end_lineno
+    ]
+
+
+def identity_and_equality_match(left, right):
+    identity_types = {"identity", "none"}
+    return (
+        left in identity_types and right in identity_types
+        or left == right and (left == "bool" or left.startswith("enum:"))
+    )
+
+
+def equivalent_comparison(path, line, before, after, observed):
+    old = comparisons_on_line(before, line)
+    new = comparisons_on_line(after, line)
+    if len(old) != 1 or len(new) != 1:
+        return False
+    a, = old
+    b, = new
+    operations = {type(a.ops[0]), type(b.ops[0])}
+    if operations not in ({ast.Is, ast.Eq}, {ast.IsNot, ast.NotEq}):
+        return False
+    domains = observed.get(f"{path}:{a.lineno}:{a.col_offset}")
+    if not domains or not all(identity_and_equality_match(*pair) for pair in domains):
+        return False
+    replacement = b.ops[0]
+    try:
+        b.ops[0] = a.ops[0]
+        return ast.dump(before) == ast.dump(after)
+    finally:
+        b.ops[0] = replacement
+
+
 def choose(patch, profile, file_cache):
     selected = 0
     nearby = 0
-    for path, section in sections(patch).items():
+    files = sections(patch)
+    for path, section in files.items():
         source = profile["sources"][path]
         updated, changed, inserted = apply_section(
             path, section, source.removesuffix("\n").split("\n")
@@ -542,19 +580,24 @@ def choose(patch, profile, file_cache):
 
         selected |= int(profile["file_reads"].get(path, "0"), 16)
         selected |= int(profile["subprocess_users"], 16)
-        nearby |= file_users(path, profile, file_cache)
         before = ast.parse(source, filename=path, type_comments=True)
         after = ast.parse(updated, filename=path, type_comments=True)
         compile(after, path, "exec")
         if ast.dump(before) == ast.dump(after):
             # Position-only edits can matter to introspection, but ordinary
             # comments do not alter the parsed program or its type directives.
+            nearby |= file_users(path, profile, file_cache)
             continue
         one_line = (
             len(changed) == 1
             and changed == inserted
             and source.count("\n") == updated.count("\n")
         )
+        if (one_line and len(files) == 1 and path.startswith("sqlglot/")
+                and equivalent_comparison(path, next(iter(changed)), before, after,
+                                          profile["comparison_operand_types"])):
+            continue
+        nearby |= file_users(path, profile, file_cache)
         if one_line:
             line = next(iter(changed))
             readers = changed_attribute(path, line, before, after, profile)
