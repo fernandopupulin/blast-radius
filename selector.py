@@ -4,6 +4,7 @@ import ast
 import gzip
 import json
 import math
+import operator
 from pathlib import Path
 import re
 from types import CodeType
@@ -269,7 +270,10 @@ def changed_attribute(path, line, before, after, profile):
         if ast.dump(before) == ast.dump(after):
             module = path.removesuffix(".py").replace("/", ".")
             owner = enclosing_class(before.body, line)
-            if exact := profile.get("attribute_owners", {}).get(name, {}).get(f"{module}:{owner}"):
+            key = f"{module}:{owner}"
+            if exact := profile["exact_attribute_owners"].get(name, {}).get(key):
+                return int(exact, 16)
+            if exact := profile.get("attribute_owners", {}).get(name, {}).get(key):
                 return int(exact, 16)
             return int(readers[name], 16)
     finally:
@@ -385,17 +389,23 @@ def class_dict_entries(body, line, owner=()):
             continue
         qualified = (*owner, definition.name)
         for node in definition.body:
-            if not (
-                isinstance(node, ast.Assign)
-                and len(node.targets) == 1
-                and isinstance(node.targets[0], ast.Name)
-                and isinstance(node.value, ast.Dict)
-            ):
+            if isinstance(node, ast.Assign) and len(node.targets) == 1:
+                target = node.targets[0]
+            elif isinstance(node, ast.AnnAssign):
+                target = node.target
+            else:
+                continue
+            if not isinstance(target, ast.Name) or not isinstance(node.value, ast.Dict):
                 continue
             for index, (key, value) in enumerate(zip(node.value.keys, node.value.values)):
-                if (isinstance(key, ast.Constant) and isinstance(key.value, str)
-                        and key.lineno <= line <= value.end_lineno):
-                    yield ".".join(qualified), node.targets[0].id, key.value, node.value, index
+                if isinstance(key, ast.Constant) and type(key.value) is str:
+                    label = key.value
+                elif target.id == "TRANSFORMS":
+                    label = expression_attribute(key)
+                else:
+                    label = None
+                if label and key.lineno <= line <= value.end_lineno:
+                    yield ".".join(qualified), target.id, label, node.value, index
         yield from class_dict_entries(definition.body, line, qualified)
 
 
@@ -426,6 +436,20 @@ def show_factory(value):
     return None
 
 
+def transform_replacement(before, after):
+    if isinstance(before, ast.Lambda) and isinstance(after, ast.Lambda):
+        return ast.dump(before.args) == ast.dump(after.args) and not any(
+            isinstance(node, ast.Name) and node.id in ("__class__", "super")
+            for expression in (before, after) for node in ast.walk(expression)
+        )
+    return all(
+        isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        and node.func.id == "rename_func" and len(node.args) == 1 and not node.keywords
+        and isinstance(node.args[0], ast.Constant) and type(node.args[0].value) is str
+        for node in (before, after)
+    )
+
+
 def class_config_change(path, line, before, after, profile):
     old_entries = {entry[:3]: entry[3:] for entry in class_dict_entries(before.body, line)}
     new_entries = {entry[:3]: entry[3:] for entry in class_dict_entries(after.body, line)}
@@ -447,6 +471,8 @@ def class_config_change(path, line, before, after, profile):
         valid = numeric_escape(old_value) and numeric_escape(new_value)
     elif attribute == "SHOW_PARSERS" and path.startswith("sqlglot/parsers/"):
         valid = show_factory(old_value) is not None and show_factory(new_value) is not None
+    elif attribute == "TRANSFORMS" and path.startswith("sqlglot/generators/"):
+        valid = transform_replacement(old_value, new_value)
     else:
         return None
     if not valid:
@@ -456,6 +482,10 @@ def class_config_change(path, line, before, after, profile):
     try:
         new.values[new_index] = old_value
         if ast.dump(before) == ast.dump(after):
+            if attribute == "TRANSFORMS":
+                entries = profile["exact_table_reads"]
+                stamp = f"G{path}:{owner}:{attribute}|{key}"
+                return int(entries[stamp], 16) if stamp in entries else None
             table = profile["dispatch_tables"].get(f"{path}:{owner}:{attribute}")
             if table is not None and (readers := table.get(key, "0")) is not None:
                 return int(readers, 16)
@@ -474,9 +504,13 @@ def expression_attribute(node):
 
 def return_type_on_line(tree, line):
     for statement in tree.body:
-        if not (isinstance(statement, ast.Assign) and len(statement.targets) == 1
-                and isinstance(statement.targets[0], ast.Name)
-                and statement.targets[0].id == "EXPRESSION_METADATA"
+        if isinstance(statement, ast.Assign) and len(statement.targets) == 1:
+            target = statement.targets[0]
+        elif isinstance(statement, ast.AnnAssign):
+            target = statement.target
+        else:
+            continue
+        if not (isinstance(target, ast.Name) and target.id == "EXPRESSION_METADATA"
                 and isinstance(statement.value, ast.Dict)):
             continue
         for key, entry in zip(statement.value.keys, statement.value.values):
@@ -490,7 +524,7 @@ def return_type_on_line(tree, line):
                     yield name, entry.values, index
 
 
-def typing_config_readers(before, after, line, profile):
+def typing_config_readers(path, before, after, line, profile):
     old = list(return_type_on_line(before, line))
     new = list(return_type_on_line(after, line))
     if len(old) != 1 or len(new) != 1:
@@ -508,6 +542,8 @@ def typing_config_readers(before, after, line, profile):
     try:
         values[new_index] = old_values[index]
         if observed and ast.dump(before) == ast.dump(after):
+            if readers := profile["exact_table_reads"].get(f"T{path}|{name}"):
+                return int(readers, 16) | int(profile["metadata_inspection"], 16)
             return (observed & int(profile["annotation_readers"], 16)) | int(profile["metadata_inspection"], 16)
         return 0
     finally:
@@ -687,6 +723,133 @@ def equivalent_order_tests(path, a, b, observed):
     return unaffected
 
 
+REPLAY_OPERATIONS = {
+    ast.Lt: operator.lt, ast.LtE: operator.le, ast.Gt: operator.gt,
+    ast.GtE: operator.ge, ast.Eq: operator.eq, ast.NotEq: operator.ne,
+}
+
+
+def literal_operand(node):
+    try:
+        value = ast.literal_eval(node)
+    except (TypeError, ValueError):
+        return False, None
+    return type(value) in (type(None), bool, int, str), value
+
+
+def replay_tests(path, line, before, after, observed):
+    old = comparisons_on_line(before, line)
+    new = comparisons_on_line(after, line)
+    if len(old) != len(new):
+        return 0
+    changed = [(a, b) for a, b in zip(old, new) if ast.dump(a) != ast.dump(b)]
+    if len(changed) != 1:
+        return 0
+    a, b = changed[0]
+    old_op = REPLAY_OPERATIONS.get(type(a.ops[0]))
+    new_op = REPLAY_OPERATIONS.get(type(b.ops[0]))
+    values = observed.get(f"{path}:{a.lineno}:{a.col_offset}")
+    if old_op is None or new_op is None or not values:
+        return 0
+    old_left, old_right = a.left, a.comparators[0]
+    new_left, new_right = b.left, b.comparators[0]
+    left_literal, left_value = literal_operand(old_left)
+    right_literal, right_value = literal_operand(old_right)
+    if left_literal == right_literal:
+        return 0
+    if left_literal:
+        original = left_value
+        valid, replacement = literal_operand(new_left)
+        unchanged_operand = ast.dump(old_right) == ast.dump(new_right)
+    else:
+        original = right_value
+        valid, replacement = literal_operand(new_right)
+        unchanged_operand = ast.dump(old_left) == ast.dump(new_left)
+    if not valid or not unchanged_operand:
+        return 0
+    ops = b.ops
+    try:
+        b.left, b.comparators[0], b.ops = old_left, old_right, a.ops
+        if ast.dump(before) != ast.dump(after):
+            return 0
+    finally:
+        b.left, b.comparators[0], b.ops = new_left, new_right, ops
+    unchanged = changed_mask = 0
+    for value, readers in values:
+        mask = int(readers, 16)
+        try:
+            if left_literal:
+                equal = old_op(original, value) == new_op(replacement, value)
+            else:
+                equal = old_op(value, original) == new_op(value, replacement)
+        except TypeError:
+            equal = False
+        if equal:
+            unchanged |= mask
+        else:
+            changed_mask |= mask
+    return unchanged & ~changed_mask
+
+
+REGION_FIELDS = {
+    ast.If: "test", ast.While: "test", ast.Assert: "test",
+    ast.Return: "value", ast.Assign: "value", ast.AugAssign: "value",
+    ast.AnnAssign: "value", ast.Expr: "value",
+}
+NESTED_EXECUTION = (ast.NamedExpr, ast.Yield, ast.YieldFrom, ast.Await, ast.Lambda,
+                    ast.GeneratorExp, ast.ListComp, ast.SetComp, ast.DictComp)
+
+
+def expression_regions(before, after):
+    """Find replacements of complete runtime expressions across independent hunks."""
+    regions = []
+
+    def align(old, new, in_body=False):
+        if type(old) is not type(new):
+            return False
+        if isinstance(old, list):
+            return len(old) == len(new) and all(align(a, b, in_body) for a, b in zip(old, new))
+        if not isinstance(old, ast.AST):
+            return old == new
+        if in_body and (field := REGION_FIELDS.get(type(old))):
+            a, b = getattr(old, field), getattr(new, field)
+            if isinstance(a, ast.expr) and isinstance(b, ast.expr) and ast.dump(a) != ast.dump(b):
+                if isinstance(old, ast.Expr) and any(
+                    isinstance(value, ast.Constant) and isinstance(value.value, str) for value in (a, b)
+                ):
+                    return False
+                if any(isinstance(node, NESTED_EXECUTION) for expr in (a, b) for node in ast.walk(expr)):
+                    return False
+                regions.append((old.lineno, a.end_lineno))
+                return all(align(value, getattr(new, name), in_body)
+                           for name, value in ast.iter_fields(old) if name != field)
+        if isinstance(old, ast.ClassDef):
+            in_body = False
+        opens_body = isinstance(old, (ast.FunctionDef, ast.AsyncFunctionDef))
+        return all(align(value, getattr(new, name), in_body or (opens_body and name == "body"))
+                   for name, value in ast.iter_fields(old))
+
+    if align(before, after) and regions:
+        return regions
+    return ()
+
+
+def measured_regions(regions, coverage):
+    if not regions:
+        return None
+    collected = set(coverage["collection"])
+    lines = coverage["lines"]
+    mask = 0
+    for start, end in regions:
+        for position in range(start, end + 1):
+            value = lines.get(str(position))
+            if position in collected or value == "":
+                return None
+            if value:
+                mask |= int(value, 16)
+    return mask
+
+
 def choose(patch, profile, file_cache):
     selected = 0
     nearby = 0
@@ -728,19 +891,20 @@ def choose(patch, profile, file_cache):
         if comparison and equivalent_comparison(path, *comparison, profile["comparison_operand_types"]):
             continue
         nearby |= file_users(path, profile, file_cache)
-        if one_line:
-            line = next(iter(changed))
-            table_readers = class_config_change(path, line, before, after, profile)
+        if path.startswith("sqlglot/") and len(files) == 1:
+            table_readers = class_config_change(path, min(changed | inserted), before, after, profile)
             if table_readers is not None:
                 selected |= table_readers | subprocess_file_users
                 continue
+        if one_line:
+            line = next(iter(changed))
             readers = changed_attribute(path, line, before, after, profile)
             if path.startswith("tests/"):
                 readers |= final_assertion_readers(before, after, line, path, profile)
             if module_readers := profile["module_literal_readers"].get(path):
                 readers |= module_literal_readers(before, after, line, module_readers)
             if path.startswith("sqlglot/typing/"):
-                readers |= typing_config_readers(before, after, line, profile)
+                readers |= typing_config_readers(path, before, after, line, profile)
             if path.startswith("sqlglot/"):
                 readers |= default_value_readers(
                     path, before, after, line, profile["files"][path], profile["default_reflection_readers"],
@@ -753,10 +917,20 @@ def choose(patch, profile, file_cache):
         unaffected = 0
         if comparison:
             unaffected = equivalent_order_tests(path, *comparison, profile["comparison_relations"])
+        if single_source_edit:
+            unaffected |= replay_tests(path, next(iter(changed)), before, after, profile["literal_replay"])
         if isolated and single_source_edit:
             unaffected |= equivalent_branch_tests(
                 path, next(iter(changed)), before, after, profile["branch_truth_domains"]
             )
+        if len(files) == 1 and path.startswith("sqlglot/"):
+            regions = expression_regions(before, after)
+            reachable = measured_regions(regions, profile["files"][path])
+            if reachable is not None:
+                baseline = compile(source, path, "exec", dont_inherit=True)
+                if lexical_layout(baseline) == lexical_layout(compiled):
+                    selected |= reachable & ~unaffected
+                    continue
         if path.startswith("tests/") or module_structure(before) != module_structure(after):
             raise ValueError("test code or module-level behavior changed")
         coverage = profile["files"][path]

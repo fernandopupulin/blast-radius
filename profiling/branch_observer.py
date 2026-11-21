@@ -4,6 +4,7 @@ import ast
 from concurrent.futures import ProcessPoolExecutor
 import gzip
 import json
+from functools import lru_cache
 from importlib.machinery import PathFinder, SourceFileLoader
 from multiprocessing.util import Finalize
 import operator
@@ -20,7 +21,12 @@ COMPARE_PROBE = "__blast_radius_order_profile__"
 REGISTER = "__blast_radius_register_table__"
 LOOKUP_ESCAPE = "__blast_radius_lookup_escape__"
 LOOKUP_PARSER = "__blast_radius_lookup_parser__"
+LOOKUP_DISPATCH = "__blast_radius_lookup_dispatch__"
 DEFAULT_PROBE = "__blast_radius_bound_default__"
+ATTRIBUTE_PROBE = "__blast_radius_attribute_profile__"
+LITERAL_PROBE = "__blast_radius_literal_profile__"
+ATTRIBUTE_NAMES = frozenset(json.loads(Path("/profile/attributes.json").read_bytes())) if os.environ.get("BLAST_AMBITIOUS") else frozenset()
+literal_values = {}
 COMPARE_OPERATORS = {
     ast.Lt: "<", ast.LtE: "<=", ast.Gt: ">", ast.GtE: ">=", ast.Eq: "==", ast.NotEq: "!=",
 }
@@ -35,6 +41,7 @@ non_boolean = set()
 registered = set()
 numeric_tables = {}
 parser_functions = {}
+dispatch_entries = {}
 test_context = ""
 submit = ProcessPoolExecutor.submit
 child_pid = None
@@ -73,6 +80,16 @@ def compare(site, operation, left, right):
 
 
 def register(owner, name, keys, table):
+    if name in ("TRANSFORMS", "EXPRESSION_METADATA"):
+        prefix = "G" if name == "TRANSFORMS" else "T"
+        explicit = set(keys)
+        for key, value in table.items():
+            if isinstance(key, type) and key.__name__ in explicit:
+                site = f"{prefix}{owner}|{key.__name__}"
+                registered.add(site)
+                entry = dispatch_entries.setdefault(id(value), (value, set()))
+                entry[1].add(site)
+        return table
     registered.add(owner)
     if name == "NUMERIC_ESCAPES":
         numeric_tables[id(table)] = (table, owner)
@@ -98,9 +115,63 @@ def lookup_parser(table, key):
     return value
 
 
+def lookup_dispatch(table, key, *, indexed=False):
+    value = table[key] if indexed else table.get(key)
+    if entry := dispatch_entries.get(id(value)):
+        active.update((site, 0) for site in entry[1])
+    return value
+
+
 def observe_default(site, bound, default):
     explicit_difference = type(bound) is not type(default) or bound != default
     active.add((site, int(explicit_difference)))
+
+
+@lru_cache(maxsize=32768)
+def lookup_owner(cls, name):
+    for base in type.__getattribute__(cls, "__mro__"):
+        namespace = type.__getattribute__(base, "__dict__")
+        if name in namespace:
+            return f"{base.__module__}:{base.__qualname__}"
+    return "?"
+
+
+def observe_attribute(receiver, name):
+    value = getattr(receiver, name)
+    kind = type(receiver)
+    cls = receiver if issubclass(kind, type) else kind
+    owner = "?" if kind is super else lookup_owner(cls, name)
+    active.add((f"A{name}|{owner}", 0))
+    return value
+
+
+def compare_literal(site, operation, constant_side, left, right):
+    value = right if constant_side == "left" else left
+    kind = type(value)
+    if site not in non_boolean:
+        if value is None or kind is bool or (kind is int and value.bit_length() <= 64) or (
+            kind is str and len(value) <= 80
+        ):
+            registry = literal_values.setdefault(site, {})
+            key = (kind, value)
+            token = registry.get(key)
+            if token is None and len(registry) < 128:
+                token = site + "|" + json.dumps(value, ensure_ascii=True, separators=(",", ":"))
+                registry[key] = token
+            if token is not None:
+                active.add((token, 0))
+            else:
+                non_boolean.add(site)
+        else:
+            non_boolean.add(site)
+    return COMPARE_FUNCTIONS[operation](left, right)
+
+
+def primitive_literal(node):
+    if isinstance(node, ast.Constant):
+        return type(node.value) in (type(None), bool, int, str)
+    return (isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd))
+            and isinstance(node.operand, ast.Constant) and type(node.operand.value) is int)
 
 
 class Instrument(ast.NodeTransformer):
@@ -118,17 +189,28 @@ class Instrument(ast.NodeTransformer):
                 target = statement.target
             else:
                 continue
-            if not (isinstance(target, ast.Name) and target.id in ("NUMERIC_ESCAPES", "SHOW_PARSERS")
+            if not (isinstance(target, ast.Name) and target.id in ("NUMERIC_ESCAPES", "SHOW_PARSERS", "TRANSFORMS")
                     and isinstance(statement.value, ast.Dict)):
                 continue
-            keys = tuple(key.value for key in statement.value.keys
-                         if isinstance(key, ast.Constant) and type(key.value) is str)
-            owner = f"R{self.path}:{'.'.join(self.owner)}:{target.id}"
+            if target.id == "TRANSFORMS":
+                if not ATTRIBUTE_NAMES:
+                    continue
+                keys = self.expression_keys(statement.value)
+                owner = f"{self.path}:{'.'.join(self.owner)}:{target.id}"
+            else:
+                keys = tuple(key.value for key in statement.value.keys
+                             if isinstance(key, ast.Constant) and type(key.value) is str)
+                owner = f"R{self.path}:{'.'.join(self.owner)}:{target.id}"
             original = statement.value
             statement.value = self.wrap(REGISTER, original, ast.Constant(owner),
                                         ast.Constant(target.id), ast.Constant(keys), original)
         self.owner.pop()
         return node
+
+    @staticmethod
+    def expression_keys(table):
+        return tuple(key.attr for key in table.keys if isinstance(key, ast.Attribute)
+                     and isinstance(key.value, ast.Name) and key.value.id == "exp")
 
     @staticmethod
     def wrap(probe, node, *args):
@@ -143,6 +225,10 @@ class Instrument(ast.NodeTransformer):
                 and function.attr == "get" and len(node.args) == 1 and not node.keywords
                 and isinstance(function.value, ast.Attribute) and function.value.attr == "numeric_escapes"):
             return self.wrap(LOOKUP_ESCAPE, node, function.value, *node.args)
+        if (ATTRIBUTE_NAMES and isinstance(function, ast.Attribute) and function.attr == "get"
+                and len(node.args) == 1 and not node.keywords and isinstance(function.value, ast.Attribute)
+                and function.value.attr in ("_dispatch", "TRANSFORMS", "expression_metadata")):
+            return self.wrap(LOOKUP_DISPATCH, node, function.value, *node.args)
         return node
 
     def visit_Subscript(self, node):
@@ -150,6 +236,17 @@ class Instrument(ast.NodeTransformer):
         if (self.path == "sqlglot/parser.py" and isinstance(node.value, ast.Name)
                 and node.value.id == "parsers" and isinstance(node.ctx, ast.Load)):
             return self.wrap(LOOKUP_PARSER, node, node.value, node.slice)
+        if (ATTRIBUTE_NAMES and isinstance(node.value, ast.Attribute) and node.value.attr == "TRANSFORMS"
+                and isinstance(node.ctx, ast.Load)):
+            call = self.wrap(LOOKUP_DISPATCH, node, node.value, node.slice)
+            call.keywords.append(ast.keyword(arg="indexed", value=ast.Constant(True)))
+            return call
+        return node
+
+    def visit_Attribute(self, node):
+        self.generic_visit(node)
+        if isinstance(node.ctx, ast.Load) and node.attr in ATTRIBUTE_NAMES:
+            return self.wrap(ATTRIBUTE_PROBE, node, node.value, ast.Constant(node.attr))
         return node
 
     def visit_If(self, node):
@@ -164,7 +261,23 @@ class Instrument(ast.NodeTransformer):
         node.value = self.instrument(node.value, condition=False)
         return node
 
-    visit_Assign = visit_Return
+    def visit_Assign(self, node):
+        self.visit_Return(node)
+        if len(node.targets) == 1:
+            node.value = self.register_metadata(node.targets[0], node.value)
+        return node
+
+    def visit_AnnAssign(self, node):
+        self.generic_visit(node)
+        node.value = self.register_metadata(node.target, node.value)
+        return node
+
+    def register_metadata(self, target, value):
+        if (ATTRIBUTE_NAMES and self.path.startswith("sqlglot/typing/") and isinstance(target, ast.Name)
+                and target.id == "EXPRESSION_METADATA" and isinstance(value, ast.Dict)):
+            return self.wrap(REGISTER, value, ast.Constant(self.path), ast.Constant(target.id),
+                             ast.Constant(self.expression_keys(value)), value)
+        return value
 
     def visit_FunctionDef(self, node):
         self.generic_visit(node)
@@ -198,10 +311,16 @@ class Instrument(ast.NodeTransformer):
     visit_AsyncFunctionDef = visit_FunctionDef
 
     def visit_Compare(self, node):
+        literals = [primitive_literal(node.left), primitive_literal(node.comparators[0])]
         self.generic_visit(node)
         if len(node.ops) != 1 or type(node.ops[0]) not in COMPARE_OPERATORS:
             return node
         site = f"C{self.path}:{node.lineno}:{node.col_offset}"
+        if ATTRIBUTE_NAMES and sum(literals) == 1:
+            return self.wrap(LITERAL_PROBE, node, ast.Constant("L" + site[1:]),
+                             ast.Constant(COMPARE_OPERATORS[type(node.ops[0])]),
+                             ast.Constant("left" if literals[0] else "right"),
+                             node.left, node.comparators[0])
         return ast.copy_location(ast.Call(
             func=ast.Name(id=COMPARE_PROBE, ctx=ast.Load()),
             args=[ast.Constant(site), ast.Constant(COMPARE_OPERATORS[type(node.ops[0])]),
@@ -243,7 +362,10 @@ class Loader(SourceFileLoader):
         module.__dict__[REGISTER] = register
         module.__dict__[LOOKUP_ESCAPE] = lookup_escape
         module.__dict__[LOOKUP_PARSER] = lookup_parser
+        module.__dict__[LOOKUP_DISPATCH] = lookup_dispatch
         module.__dict__[DEFAULT_PROBE] = observe_default
+        module.__dict__[ATTRIBUTE_PROBE] = observe_attribute
+        module.__dict__[LITERAL_PROBE] = compare_literal
         return super().exec_module(module)
 
     def get_code(self, fullname):

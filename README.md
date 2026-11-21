@@ -1,4 +1,4 @@
-# Blast Radius v11
+# Blast Radius v12
 
 A v6 acompanha também os testes que leem os atributos de classe nos quais `setUpClass` armazena pares de SQL. Quando a mudança preserva a estrutura e os metadados que o carregador usa, seleciona esses consumidores e os leitores diretos. Uma mudança que possa afetar a preparação mantém a cobertura compartilhada de toda a classe.
 
@@ -17,6 +17,8 @@ A cobertura dos interpretadores iniciados por subprocessos separa os arquivos qu
 A última versão rastreia o consumo das entradas de despacho de SHOW e de escapes numéricos, inclusive quando a tabela de despacho é copiada para uma subclasse. Uma edição isolada precisa preservar as chaves e corresponder à estrutura de uma configuração conhecida. Para argumentos padrão imutáveis, a coleta identifica chamadas que sempre receberam um valor distinto do padrão original.
 
 Uma edição isolada de expressão pode usar sua cobertura durante a execução mesmo quando a função que a contém também é chamada durante a coleta. O seletor exige que as linhas da expressão tenham cobertura atribuída ou permaneçam sem execução, que a coleta não execute a expressão e que a compilação preserve a estrutura dos escopos léxicos. Mudanças fora dessas condições seguem a seleção conservadora.
+
+A v12 registra a classe que fornece o atributo lido e a entrada de despacho usada pelo gerador ou anotador. Compara alterações de limites e literais com os operandos primitivos observados na suíte original. Se houver um valor desconhecido no ponto de comparação, preserva a seleção anterior. O seletor também usa a cobertura de várias expressões editadas no mesmo arquivo quando as demais instruções e os escopos léxicos coincidem.
 
 O mapa reúne os testes que passaram por qualquer leitura Python observada, inclusive em código compartilhado. A geração descarta nomes com acesso literal indireto, importação, referências sem cobertura ou leitura durante a coleta. A regra cobre alterações simples de literais, com os demais casos encaminhados à lógica de cobertura da v2 ou à suíte inteira. A análise estática pode deixar de encontrar acessos puramente dinâmicos, por exemplo nomes construídos em tempo de execução.
 
@@ -39,6 +41,7 @@ A coleta adicional registra as classes usadas por cada teste, incluindo suas sup
 | v9, condições por teste e cobertura de subprocessos | 117,803 | 0 |
 | v10 experimental, entradas de tabelas e argumentos padrão | 106,505 | 0 |
 | v11, cobertura de expressões e escopos léxicos | 104,474 | 0 |
+| v12, operandos, leituras precisas e despacho por entrada | 104,474 | 0 |
 
 Em prática, a v5 registrou 559,384 s simulados e zero misses, com 560,7 s oficiais. A v4 registrou 528,624 s de seleção e um miss, para 829,9 s oficiais.
 
@@ -61,6 +64,8 @@ A v9 cobriu as mesmas 21 mutações com 156,407 s simulados de custo combinado e
 Mais nove mutações foram executadas com a suíte completa. A v9 cobriu todas as falhas e reduziu o custo desse grupo de 194,827 s na v8 para 188,970 s. Nas trocas comportamentalmente equivalentes de condição e limite trimestral, selecionou zero workers. Uma importação antecipada de dialeto ainda selecionou o teste do interpretador isolado que falhou.
 
 A v11 cobriu todas as falhas verificadas nas 30 mutações. O custo combinado caiu de 345,377 s na v9 para 270,965 s. No caso de despacho MySQL, o custo caiu de 25,454 s para 2,018 s. A mudança no limite de nós do parser manteve o teste que falhou e custou 30,819 s.
+
+A v12 cobriu todas as falhas verificadas em 38 mutações independentes. O custo simulado total caiu de 384,431 s na v11 para 273,530 s. Em duas mutações de despacho do Snowflake, a seleção passou de 1.620 testes para dois em cada caso, incluindo os dois testes que falharam em cada mutação. O último resultado oficial registrado é 501,9 s com zero misses para a v11.
 
 ## Executar com o kit
 
@@ -102,6 +107,15 @@ BLAST_BRANCH_DISCOVER=1 PYTHON_CPU_COUNT=4 SKIP_INTEGRATION=0 PYTHONPATH=/profil
 python /profile/build_branch_map.py /profile/subprocess.json.gz /profile/results /profile/release.json.gz
 ```
 
-Copie `/profile/release.json.gz` para a raiz com o nome `impact.json.gz`. Os geradores usam o checkout e as observações do commit fixado. Use uma pasta `/profile/results` vazia para cada coleta.
+Para a coleta adicional, preserve os JSONs produzidos por `profile_classes.py` em `/profile/owner-results`. Mova os resultados de condições e recrie `/profile/results` vazio.
+
+```sh
+cp /profile/attribute-names.json /profile/attributes.json
+BLAST_AMBITIOUS=1 BLAST_BRANCH_DISCOVER=1 PYTHON_CPU_COUNT=4 SKIP_INTEGRATION=0 PYTHONPATH=/profile:/src \
+  python -c 'import branch_observer; raise SystemExit(branch_observer.main())'
+python /profile/build_replay_map.py /profile/release.json.gz /profile/results /profile/owner-results /profile/ambitious.json.gz
+```
+
+Copie `/profile/ambitious.json.gz` para a raiz com o nome `impact.json.gz`. Os geradores usam o checkout e as observações do commit fixado.
 
 Em uma segunda validação independente, alterei `BigQuery.WEEK_OFFSET` de −1 para 0 e rodei a suíte completa. Dez subtestes falharam dentro de `tests/test_optimizer.py::TestOptimizer::test_simplify`, que vale como um teste no scorer. A v3 incluiu esse teste entre os 10 que selecionou.
