@@ -5,8 +5,12 @@ import gzip
 import json
 import math
 import operator
+import os
 from pathlib import Path
 import re
+import subprocess
+import sys
+import time
 from types import CodeType
 
 DATA = Path("/data")
@@ -1017,6 +1021,98 @@ def reserve_workers(primary, candidates, durations):
     return workers
 
 
+TPCDS = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
+
+
+class QueryVerification:
+    def __init__(self, checkpoints):
+        self.checkpoints = checkpoints
+        self.remaining = 20.0
+        self.deadline = time.monotonic() + 100
+
+    def equivalent(self, patch, profile, saving):
+        remaining = min(self.remaining, self.deadline - time.monotonic())
+        if saving < 8000 or remaining < 2.0:
+            return False
+        files = sections(patch)
+        if len(files) != 1:
+            return False
+        path, section = next(iter(files.items()))
+        if path not in self.checkpoints["lines"] or not path.startswith("sqlglot/optimizer/"):
+            return False
+        baseline_bit = 1 << profile["ids"].index(TPCDS)
+        if int(profile["file_reads"].get(path, "0"), 16) & baseline_bit:
+            return False
+        source = profile["sources"][path]
+        updated, removed, inserted = apply_section(path, section, source.removesuffix("\n").split("\n"))
+        if len(removed) != 1 or removed != inserted or source.count("\n") != updated.count("\n"):
+            return False
+        before, after = ast.parse(source, filename=path), ast.parse(updated, filename=path)
+        line, = removed
+        region = isolated_expression_change(before, after, line)
+        if not region:
+            return False
+        old = expression_on_line(before, line)[0][2]
+        new = expression_on_line(after, line)[0][2]
+        if not both_predicates(old, new):
+            return False
+        if lexical_layout(compile(before, path, "exec")) != lexical_layout(compile(after, path, "exec")):
+            return False
+        if set(region).intersection(self.checkpoints["outside"].get(path, ())):
+            return False
+        covered = self.checkpoints["lines"][path]
+        affected = sorted({index for pos in region for index in covered.get(str(pos), ())})
+        if not affected:
+            return False
+        expected = [(index, self.checkpoints["checkpoints"].get(str(index))) for index in affected]
+        if any(value is None for _, value in expected):
+            return False
+        limit = min(5.0, remaining - 1, saving / 3000)
+        request = {"path": path, "source": updated, "queries": expected, "cpu_limit": limit}
+        verified, elapsed = run_probe(request, limit)
+        self.remaining -= elapsed
+        return verified
+
+
+def run_probe(request, limit):
+    started = time.monotonic()
+    verified = False
+    try:
+        completed = subprocess.run(
+            [sys.executable, str(Path(__file__).with_name("query_probe.py"))],
+            input=json.dumps(request).encode(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=limit + 1,
+            env={**os.environ, "PYTHONHASHSEED": "0", "PYTHONDONTWRITEBYTECODE": "1",
+                 "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1", "SKIP_INTEGRATION": "0"},
+        )
+        verified = completed.returncode == 0 and completed.stdout == b"verified\n"
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return verified, time.monotonic() - started
+
+
+def both_predicates(old, new):
+    if not isinstance(old, (ast.BoolOp, ast.Compare, ast.UnaryOp)) or not isinstance(
+        new, (ast.BoolOp, ast.Compare, ast.UnaryOp)
+    ):
+        return False
+
+    def normalized(node):
+        if isinstance(node, ast.Constant) and type(node.value) in (str, int, bool):
+            return ("literal", type(node.value).__name__)
+        if isinstance(node, (ast.cmpop, ast.boolop)):
+            return "operator"
+        if isinstance(node, ast.AST):
+            return type(node).__name__, tuple(normalized(value) for _, value in ast.iter_fields(node))
+        if isinstance(node, list):
+            return tuple(map(normalized, node))
+        return node
+
+    return normalized(old) == normalized(new)
+
+
 def main(data=DATA, mapping=MAP):
     tests = json.loads((data / "tests.json").read_text(encoding="utf-8"))["tests"]
     profile = json.loads(gzip.decompress(mapping.read_bytes()))
@@ -1034,9 +1130,13 @@ def main(data=DATA, mapping=MAP):
     fallback = partition(all_tests)
     durations = dict(all_tests)
     file_cache = {}
+    checkpoint_file = Path(__file__).with_name("query-checkpoints.json")
+    tpcds = next((test["number"] for test in tests if test["id"] == TPCDS), None)
+    verifier = QueryVerification(json.loads(checkpoint_file.read_bytes())) if checkpoint_file.is_file() else None
     for path in sorted((data / "commits").glob("*.patch")):
         try:
-            mask, nearby = choose(path.read_text(encoding="utf-8"), profile, file_cache)
+            patch = path.read_text(encoding="utf-8")
+            mask, nearby = choose(patch, profile, file_cache)
         except (LookupError, ValueError, SyntaxError, RecursionError):
             workers = fallback
         else:
@@ -1044,6 +1144,15 @@ def main(data=DATA, mapping=MAP):
             extra = nearby & ~mask
             candidates = [test for bit, test in known if extra & bit]
             workers = reserve_workers(primary, candidates, durations)
+            if verifier and tpcds is not None and any(number == tpcds for number, _ in primary):
+                reduced = reserve_workers(
+                    [entry for entry in primary if entry[0] != tpcds],
+                    [entry for entry in candidates if entry[0] != tpcds],
+                    durations,
+                )
+                saving = worker_cost(workers, durations) - worker_cost(reduced, durations)
+                if verifier.equivalent(patch, profile, saving):
+                    workers = reduced
         print(json.dumps({"commit": path.stem, "workers": workers}, separators=(",", ":")))
 
 

@@ -3,3 +3,6 @@
 !selector.py
 !impact.json.gz
 !LICENSE-SQLGLOT
+!query_probe.py
+!query-checkpoints.json
+!upstream.tar.gz

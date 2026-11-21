@@ -1,4 +1,29 @@
-# Blast Radius v12
+# Blast Radius v13
+
+A v13 mantém o seletor estático da v12 e acrescenta verificação real de consultas TPC-DS com o patch aplicado. Usa a cobertura de cada consulta até a saída do otimizador. Reexecuta as consultas alcançadas e compara os grafos que seguiriam para o planejador. O teste inteiro continua selecionado se a mudança puder afetar outra fase, se o grafo mudar ou se a verificação ultrapassar seu orçamento.
+
+Uma variante de laboratório executou também candidatos baratos de dialetos com pytest em subprocesso. No lote de revisão ela consumiu CPU adicional sem eliminar mais testes. A imagem final contém apenas a verificação TPC-DS, com execução sem rede e orçamento de CPU e tempo.
+
+O perfil TPC-DS foi coletado executando o teste original do SQLGlot com suas próprias fixtures e comparações. Durante a coleta, as tarefas do pool foram executadas em ordem no mesmo processo, com ida e volta via pickle. Isso permite atribuir o caminho de otimização a cada consulta. A seleção mantém o teste se o patch atingir código observado fora da otimização. O arquivo de perfil contém somente observações da revisão fixada.
+
+## Medição local
+
+No lote de 68 patches com resultados conhecidos, a v12 marcou 378,004 s simulados e consumiu 12,501 s de CPU. A v13 marcou 358,261 s simulados e consumiu 13,434 s de CPU, incluindo os processos de verificação. A soma caiu cerca de 18,8 s. Nenhuma das duas versões teve misses nesse lote. No caso de alteração da condição simétrica do simplificador, a seleção passou de 25,454 s para 5,711 s e manteve os testes que realmente falhavam. O ganho depende das consultas e alterações presentes no lote recebido.
+
+## Referências de arquitetura
+
+- A verificação por consulta foi motivada pela granularidade observada em [fortnite pirate token](https://github.com/jklein07/blast-radius), [JstD](https://github.com/JstD/builder-rwx), [Undertaker](https://github.com/StrikerX99/undertakers-blast-radius-v5), [Boilerbuild](https://github.com/EkagraAgarwal/boilerbuild-blast-radius) e [cookie-is-yummy](https://github.com/cookie-is-yummy/buildathon).
+- O orçamento e a confirmação do carregamento do patch foram orientados pelas verificações dinâmicas de [Umbermill](https://github.com/t-sibiraj/umbermill), [anti-67](https://github.com/NurdauletZhalgas/Blast-radius) e [not even close](https://github.com/Th3r0n/rwx-blast-radius).
+- A separação entre execução, coleta, transporte e leitores de dados segue as perguntas levantadas por [ttham.t](https://github.com/teetham-t/rwx-blast-radius), [Niranjan](https://github.com/niranjankumarnk/blast-radius), [Error_404](https://github.com/arnav-goel05/rwx-blast-radius) e [rafigmammadov](https://github.com/rafigmammadov/rwx-blast-radius). A v13 foi implementada no código da Antalos.
+
+## Regenerar o perfil de consultas
+
+Use a revisão fixada do SQLGlot como diretório de execução e inclua a raiz deste repositório e a raiz do SQLGlot no `PYTHONPATH`. Rode em Linux com Python 3.13 e as dependências travadas de perfil.
+
+```sh
+SKIP_INTEGRATION=0 PYTHONHASHSEED=0 python /lab/profiling/record_queries.py /lab/query-checkpoints.json
+python /lab/profiling/pack_probe.py /src /lab/upstream.tar.gz
+```
 
 A v6 acompanha também os testes que leem os atributos de classe nos quais `setUpClass` armazena pares de SQL. Quando a mudança preserva a estrutura e os metadados que o carregador usa, seleciona esses consumidores e os leitores diretos. Uma mudança que possa afetar a preparação mantém a cobertura compartilhada de toda a classe.
 
